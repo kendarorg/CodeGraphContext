@@ -62,7 +62,7 @@ def relative(value):
     return value[len(base) + 1:] if value.startswith(base + "/") else value
 
 
-def identity(label, path, name, line, occurrence):
+def identity_of(label, path, name, line, occurrence):
     return [label, relative(path), name, line, occurrence]
 
 
@@ -79,22 +79,55 @@ async def main():
     else:
         await initialize_repository(builder, project)
 
+    embedded = backend in ("kuzudb", "ladybugdb")
     nodes, edges, errors = [], [], []
+    identities = {}
     with driver.session() as session:
-        for label in sorted(NODE_LABELS):
+        # ExternalClass is written by the writers but is not in NODE_LABELS;
+        # edges to it must still resolve to an identity.
+        labels, rel_types = sorted(NODE_LABELS | {"ExternalClass"}), sorted(RELATIONSHIP_TYPES)
+        if embedded:
+            # Every table the schema declares: an edge endpoint can carry a
+            # label that the contract lists nowhere. Types in the contract that
+            # no table declares are left out, since querying them is a binder error.
+            kinds = {row["name"]: row["type"] for row in session.run(
+                "CALL show_tables() RETURN name, type").data()}
+            labels = sorted(name for name, kind in kinds.items() if kind == "NODE")
+            rel_types = sorted(name for name, kind in kinds.items() if kind == "REL")
+        # Node ids are the join key for embedded edges: Kùzu and LadybugDB
+        # have no property named like the others on every table.
+        for label in labels:
             try:
-                for rec in session.run(
-                    f"MATCH (n:`{label}`) RETURN n.path AS path, n.name AS name, "
-                    "n.line_number AS line, n.occurrence_index AS occurrence"
-                ):
+                columns = {"path", "name", "line_number", "occurrence_index"}
+                if embedded:
+                    # A property missing from a table is a binder error on
+                    # Kùzu and LadybugDB; select only what the table declares.
+                    declared = {row["name"] for row in session.run(
+                        f"CALL table_info('{label}') RETURN name").data()}
+                    columns &= declared
+                select = ", ".join(
+                    f"n.{c} AS {c}" if c in columns else f"NULL AS {c}"
+                    for c in ("path", "name", "line_number", "occurrence_index"))
+                for rec in session.run(f"MATCH (n:`{label}`) RETURN id(n) AS nid, {select}"):
                     row = dict(rec)
-                    nodes.append(json.dumps(
-                        identity(label, row["path"], row["name"], row["line"], row["occurrence"]),
-                        sort_keys=True))
+                    identity = identity_of(label, row["path"], row["name"], row["line_number"],
+                                           row["occurrence_index"])
+                    identities[str(row["nid"])] = identity
+                    nodes.append(json.dumps(identity, sort_keys=True))
             except Exception as exc:
                 errors.append(f"node {label}: {exc}")
-        for rel in sorted(RELATIONSHIP_TYPES):
+        for rel in rel_types:
             try:
+                if embedded:
+                    for rec in session.run(f"MATCH (a)-[:`{rel}`]->(b) RETURN id(a) AS aid, id(b) AS bid"):
+                        row = dict(rec)
+                        ends = [identities.get(str(row[key])) for key in ("aid", "bid")]
+                        if None in ends:
+                            # An endpoint outside the dumped labels; ids differ between runs, so fail loudly.
+                            errors.append(f"relationship {rel}: endpoint not in dumped labels")
+                            continue
+                        edges.append(json.dumps([rel, ends[0], ends[1]], sort_keys=True))
+                    continue
                 for rec in session.run(
                     f"MATCH (a)-[:`{rel}`]->(b) RETURN labels(a)[0] AS alabel, a.path AS apath, "
                     "a.name AS aname, a.line_number AS aline, a.occurrence_index AS aoccurrence, "
@@ -104,8 +137,8 @@ async def main():
                     row = dict(rec)
                     edges.append(json.dumps([
                         rel,
-                        identity(row["alabel"], row["apath"], row["aname"], row["aline"], row["aoccurrence"]),
-                        identity(row["blabel"], row["bpath"], row["bname"], row["bline"], row["boccurrence"]),
+                        identity_of(row["alabel"], row["apath"], row["aname"], row["aline"], row["aoccurrence"]),
+                        identity_of(row["blabel"], row["bpath"], row["bname"], row["bline"], row["boccurrence"]),
                     ], sort_keys=True))
             except Exception as exc:
                 errors.append(f"relationship {rel}: {exc}")
@@ -187,6 +220,7 @@ def test_repo_init_matches_standard_path(backend, fixture, tmp_path, request, du
     standard = _dump(backend, "standard", project, tmp_path, backend_env, dump_script)
     repo_init = _dump(backend, "repo_init", project, tmp_path, backend_env, dump_script)
 
+    assert standard["nodes"], "standard path wrote no nodes; the comparison would be empty"
     assert not standard["errors"], f"standard path query errors: {standard['errors']}"
     assert not repo_init["errors"], f"repo_init query errors: {repo_init['errors']}"
     assert standard["nodes"] == repo_init["nodes"], _describe_difference(

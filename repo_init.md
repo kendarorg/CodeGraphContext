@@ -69,6 +69,7 @@ whole-index times, not write-only times.
 
 ## Kùzu and LadybugDB rules that matter
 
+- **COPY paths:** the Parquet path goes inside a quoted Cypher literal. On Windows the separators are written as `/` (`copy_path` in `bulk_kuzu.py`); LadybugDB rejects backslashes there as escape sequences.
 - **Primary key `uid`** for code nodes is the concatenation of the identity fields from
   `uid_map`, with `occurrence_index` defaulting to 0 and no separator (`kuzu_uid`).
   Module is keyed by `name`; File by `path`.

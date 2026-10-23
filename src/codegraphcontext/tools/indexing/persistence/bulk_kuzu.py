@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import sys
 import tempfile
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -392,6 +393,18 @@ def build_call_edges(
     return list(edges.values())
 
 
+def copy_path(path: str) -> str:
+    """A file path as written inside a COPY statement.
+
+    On Windows the separators become "/": LadybugDB reads backslashes in the
+    quoted literal as escape sequences and rejects the statement. Other
+    platforms get the path unchanged.
+    """
+    if sys.platform == "win32":
+        return path.replace("\\", "/")
+    return path
+
+
 def copy_node_table(session: Any, label: str, rows: List[Dict[str, Any]], tmp_dir: str) -> None:
     """COPY node rows into one node table, typed by the table's own columns."""
     import pyarrow as pa
@@ -408,7 +421,7 @@ def copy_node_table(session: Any, label: str, rows: List[Dict[str, Any]], tmp_di
     path = os.path.join(tmp_dir, f"{label}.parquet")
     pq.write_table(pa.table(dict(zip(names, arrays))), path)
     try:
-        session.run(f"COPY `{label}` FROM \"{path}\"")
+        session.run(f"COPY `{label}` FROM \"{copy_path(path)}\"")
     except Exception as exc:
         raise RuntimeError(f"Bulk COPY into {label} failed ({len(rows)} rows): {exc}") from exc
 
@@ -462,7 +475,7 @@ def copy_rel_rows(
         pq.write_table(pa.table(arrays), path)
         try:
             session.run(
-                f"COPY `{rel_label}` FROM \"{path}\" (from=\"{from_label}\", to=\"{to_label}\")"
+                f"COPY `{rel_label}` FROM \"{copy_path(path)}\" (from=\"{from_label}\", to=\"{to_label}\")"
             )
         except Exception as exc:
             raise RuntimeError(

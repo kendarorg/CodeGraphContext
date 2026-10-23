@@ -30,6 +30,15 @@ Marked `parity` and deselected by default (`addopts` in `pyproject.toml`), so `p
 
 ---
 
+## 🪟 Windows Notes
+
+Verified on Windows 11 (Python 3.14, Docker over `DOCKER_HOST`):
+
+*   **Parity suite:** passes. The Kùzu legs skip, because no `kuzu` wheel exists for Python 3.14 on Windows. LadybugDB, Neo4j and NornicDB run.
+*   **Unit and integration suites:** 51 failed and 17 errors. The same counts occur on a clean checkout of HEAD, so they predate the parity work. Most come from POSIX path literals (for example `/repo/src`, which Windows resolves to `C:/repo/src`). The rest are golden-file and CLI output tests. Affected files: `tests/integration/test_parser_goldens.py`, `test_cgcignore_cli.py`, `test_find_text_output_stream.py`, `test_analyze_text_output_stream.py`, `test_analyze_complexity_ci.py`, `test_diagram_export.py`, `test_vector_resolve_visibility.py`, `test_context_repo_registration.py`, `tests/integration/cli/test_cli_commands.py`, `tests/unit/tools/test_bulk_directory_contains.py`, `test_bulk_retry.py`, `test_contains_invariant_repair.py`, `tests/unit/parsers/test_elisp_parser.py`, `tests/unit/core/test_database_falkordb_wrapper.py`, `tests/unit/cli/test_setup_wizard_jsonc.py`.
+
+---
+
 ## 🏗️ Test Architecture
 
 The test suite follows the **Testing Pyramid** principle, ensuring a balanced mix of speed and confidence.
