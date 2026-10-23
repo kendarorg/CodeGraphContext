@@ -161,25 +161,21 @@ Standard behaviour must stay exact until a change is agreed.
 
 ## Neo4j and NornicDB test setup
 
-- Neo4j test container: `cgc-neo4j-test` (Neo4j 5.15.0) on `127.0.0.1:7687`, user `neo4j`,
-  password `cgctestpw`. Local test only. Remove with `docker rm -f cgc-neo4j-test`.
-- NornicDB test container: `cgc-nornic-test` (`timothyswt/nornicdb-amd64-cpu-headless`,
-  NornicDB 1.4.3, auth off). Published host ports are not reachable on this machine, so the
-  parity check runs in a client container (`cgc-probe`, Python 3.12) on the Docker network
-  `cgc-net`, connecting to NornicDB by container IP. Test only.
+Neo4j and NornicDB run in Docker containers started by the parity suite (`tests/parity/conftest.py`, testcontainers). Nothing is started by hand:
+
+- Neo4j: `neo4j:5.12.0-community`.
+- NornicDB: `timothyswt/nornicdb-amd64-cpu-headless`, pinned by digest, auth off. Its HTTP health endpoint is the readiness check.
+- Docker is found through `DOCKER_HOST` when set. Ryuk is disabled (`TESTCONTAINERS_RYUK_DISABLED=true`).
+
+Run with `./tests/run_tests.sh parity`. The suite is not part of the default test runs.
 
 ## How to verify a change
 
 Environment: WSL, `~/cgc-venv` (Python 3.14), project installed with `.[dev]` and `.[kuzu]`.
 
-Scripts live in the session scratchpad, not in the repository:
-- `parity_run.py <standard|repo_init> <repo> <out.json>` (Kùzu, one DB directory per run).
-- `parity_neo4j.py <standard|repo_init> <repo> <out.json>` (Neo4j; wipes the graph first).
-- `parity_nornic.py` (run inside `cgc-probe`; `NORNIC_URI` set; Neo4j code path).
-- `parity_ladybug.py` (LadybugDB; fresh HOME and `LADYBUGDB_PATH`).
-- `spy_run.py` (counts COPY rows per type; confirms the bulk branch ran).
-- `time_backend.py` (standard-path timing per backend).
-- `verify_embed.py` (phase 4 on Neo4j with fastembed).
+The comparisons are automated in `tests/parity/`:
+- `test_repo_init_parity.py`: repo_init against the standard path, per backend and fixture.
+- `test_verify_databases_parity.py`: counts and edge sets across all backends.
 
 Checks, in order: `py_compile`, `ruff check --select F821,F811,F401`, the six-fixture
 comparison (`indexed_at` stripped), the spy on a fixture that has the type, then

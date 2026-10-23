@@ -10,7 +10,7 @@ import codegraphcontext.core as core
 
 @pytest.fixture
 def parity(monkeypatch):
-    source = Path(__file__).resolve().parents[2] / 'e2e' / 'test_verify_databases_parity.py'
+    source = Path(__file__).resolve().parents[2] / 'parity' / 'test_verify_databases_parity.py'
     spec = importlib.util.spec_from_file_location('cgc_parity_guard_test', source)
     parity = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(parity)
@@ -28,7 +28,7 @@ def parity(monkeypatch):
 async def test_contains_deficit_is_not_accepted(monkeypatch, tmp_path, deficit, parity):
     indexed_backends = []
 
-    async def indexed_stats(db_type, project_path, temp_test_dir):
+    async def indexed_stats(db_type, project_path, temp_test_dir, backend_env=None):
         indexed_backends.append(db_type)
         return 0.0, {'NODE_File': 292, 'REL_CONTAINS': 4727 - (deficit if db_type == 'ladybugdb' else 0)}, [], [], []
 
@@ -38,7 +38,7 @@ async def test_contains_deficit_is_not_accepted(monkeypatch, tmp_path, deficit, 
             await parity._run_database_parity_e2e(tmp_path)
     else:
         await parity._run_database_parity_e2e(tmp_path)
-    assert set(indexed_backends) == {'kuzudb', 'ladybugdb', 'falkordb', 'neo4j'}
+    assert set(indexed_backends) == {'kuzudb', 'ladybugdb', 'falkordb', 'neo4j', 'nornic'}
 
 
 @pytest.mark.asyncio
@@ -47,7 +47,7 @@ async def test_equal_counts_with_different_edges_fail_and_save_diagnostics(monke
     right = [source, ['Function', 'example.py', 'work', 1, 0]]
     wrong = [source, ['Function', 'example.py', 'work', 1, 1]]
 
-    async def indexed_stats(db_type, project_path, temp_test_dir):
+    async def indexed_stats(db_type, project_path, temp_test_dir, backend_env=None):
         return 0.0, {'REL_CONTAINS': 1}, [], [wrong if db_type == 'ladybugdb' else right], []
 
     monkeypatch.setattr(parity, 'run_indexing_in_process', indexed_stats)

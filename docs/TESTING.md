@@ -14,6 +14,19 @@ We provide a helper script `tests/run_tests.sh` to simplify test execution.
 | **Fast Tests** | `./tests/run_tests.sh fast` | **Recommended for local dev.** Runs Unit + Integration. |
 | **Unit Tests** | `./tests/run_tests.sh unit` | Focus on individual components (parsers, database logic). |
 | **User Journeys** | `./tests/run_tests.sh e2e` | Validate full end-to-end user workflows. |
+| **Parity** | `./tests/run_tests.sh parity` | Live-database parity (Neo4j, NornicDB in Docker). Not part of `fast`, `e2e` or `all`. |
+
+### Parity suite (`tests/parity/`)
+
+Marked `parity` and deselected by default (`addopts` in `pyproject.toml`), so `pytest` and CI's fast and e2e jobs never start it. Run it with `pytest tests/parity -m parity` or `./tests/run_tests.sh parity`.
+
+*   **Docker is required.** Neo4j (`neo4j:5.12.0-community`) and NornicDB (`timothyswt/nornicdb-amd64-cpu-headless`, pinned by digest) start as containers through `testcontainers`. A missing daemon fails the run; it does not skip.
+*   **Remote daemons:** set `DOCKER_HOST` (e.g. `tcp://192.168.1.45:2375`). Without it, the local default socket is used.
+*   **Ryuk is disabled** (`TESTCONTAINERS_RYUK_DISABLED=true`, set by `conftest.py`, the run script and CI). The reaper container fails on remote hosts. Containers stop when their fixture ends; after a crash, `docker ps` shows leftovers.
+*   **Contents:**
+    *   `test_verify_databases_parity.py`: node and relationship counts and CONTAINS/CALLS edge sets across KùzuDB, LadybugDB, FalkorDB Lite, Neo4j and NornicDB.
+    *   `test_repo_init_parity.py`: for each backend and fixture, `repo_init` must write the same nodes and relationships as the standard index path.
+*   Each index runs in a subprocess with its own database, as in the other end-to-end tests.
 
 ---
 
@@ -107,8 +120,9 @@ These ideas are consolidated from the legacy `IDEAL_TEST_PLAN.md`.
 ### 3. Snapshot Testing for Parsers
 *   **Idea**: Instead of asserting specific keys, verify the entire JSON output of a parser against a stored "snapshot". This makes updating parser tests much faster when schema changes.
 
-### 4. Testcontainers Integration
-*   **Idea**: In E2E tests, spin up a real Docker container for Neo4j/FalkorDB to guarantee 100% accurate database behavior, removing all mocks.
+### 4. Testcontainers Integration (partly done)
+*   **Done**: Neo4j and NornicDB in the parity suite run in containers (see above). FalkorDB is not containerised yet.
+*   **Idea**: Use the same fixtures for E2E tests that need a server.
 
 ### 5. Multi-Repo Analysis Workflows
 *   **Idea**: E2E tests simulating a user querying calls *across* two different repositories (microservices scenario).

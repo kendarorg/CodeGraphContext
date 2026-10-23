@@ -54,6 +54,14 @@ case "$TEST_TYPE" in
         echo -e "${YELLOW}Running All Tests...${NC}"
         pytest tests/ -v
         ;;
+
+    "parity")
+        echo -e "${YELLOW}Running Live-Database Parity (Docker required)...${NC}"
+        # Neo4j and NornicDB run in containers. Ryuk is off: the reaper container
+        # fails on remote Docker hosts (DOCKER_HOST).
+        export TESTCONTAINERS_RYUK_DISABLED=true
+        pytest tests/parity/ -m parity -v -s
+        ;;
     
     "help"|"-h"|"--help")
         echo "Usage: ./tests/run_tests.sh [option]"
@@ -63,7 +71,8 @@ case "$TEST_TYPE" in
         echo "  integration  - Run integration tests (mid)"
         echo "  e2e          - Run E2E tests (slow, requires environment)"
         echo "  fast         - Run unit + integration"
-        echo "  all          - Run everything [default]"
+        echo "  all          - Run everything, except parity [default]"
+        echo "  parity       - Live-database parity (Neo4j, NornicDB; needs Docker)"
         exit 0
         ;;
     

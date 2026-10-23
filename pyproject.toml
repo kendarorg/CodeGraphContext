@@ -142,6 +142,9 @@ dev = [
     # in transitively; tests/unit/api/test_mcp_streamable_http.py needs the
     # real package directly.
     "httpx",
+    # Live-database parity suite (tests/parity). Pinned: the container
+    # wiring relies on this exact API.
+    "testcontainers==4.15.0",
 ]
 # Optional drivers for `cgc datasource` ingestion (MySQL/Aurora, Cassandra).
 # Redis ingestion uses the ``redis`` package already pinned in core deps.
@@ -184,5 +187,8 @@ norecursedirs = ["tests/fixtures", "tests/e2e/sample_projects", "venv", ".git", 
 markers = [
     "integration: mark a test as an integration test.",
     "e2e: mark a test as an end-to-end test.",
-    "slow: mark test as slow."
+    "slow: mark test as slow.",
+    "parity: live-database parity suite (Neo4j/NornicDB in Docker). Deselected by default; run with -m parity.",
 ]
+# Parity needs Docker and runs for minutes; plain `pytest` must not start it.
+addopts = "-m 'not parity'"

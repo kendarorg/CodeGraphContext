@@ -9,6 +9,9 @@ import pytest
 from pathlib import Path
 from typing import Tuple, Dict
 
+# Neo4j and NornicDB come from containers started by tests/parity/conftest.py.
+pytestmark = pytest.mark.parity
+
 def _probe_embedded_backend(module_name: str):
     """探测嵌入式后端（kuzu / ladybug）在本环境是否真的可用。
 
@@ -48,13 +51,13 @@ def _probe_embedded_backend(module_name: str):
 
 
 # We run indexing as a subprocess to keep PyBind11 namespace and database environments isolated
-async def run_indexing_in_process(db_type: str, project_path: Path, temp_test_dir: Path) -> Tuple[float, Dict[str, int], list, list, list]:
+async def run_indexing_in_process(db_type: str, project_path: Path, temp_test_dir: Path, backend_env: Dict[str, str] = None) -> Tuple[float, Dict[str, int], list, list, list]:
     print(f"\n================= RUNNING {db_type.upper()} INDEXING IN SUBPROCESS =================")
     
     db_path = (temp_test_dir / f"{db_type}_test_db").as_posix()
     
     # Pre-clean database directories to ensure no residual states
-    if db_type != "neo4j":
+    if db_type not in ("neo4j", "nornic"):
         print(f"Clearing database directory at: {db_path}")
         if os.path.isdir(db_path):
             shutil.rmtree(db_path, ignore_errors=True)
@@ -83,9 +86,6 @@ async def run_indexing_in_process(db_type: str, project_path: Path, temp_test_di
 import os, sys, asyncio, json
 from dotenv import load_dotenv
 load_dotenv(r'{dotenv_path_str}')
-os.environ.setdefault('NEO4J_URI', 'bolt://localhost:7687')
-os.environ.setdefault('NEO4J_USERNAME', 'neo4j')
-os.environ['NEO4J_PASSWORD'] = '12345678'
 sys.path.insert(0, os.path.abspath('src'))
 from codegraphcontext.core import get_database_manager
 from codegraphcontext.tools.graph_builder import GraphBuilder
@@ -96,8 +96,8 @@ async def run():
     os.environ['CGC_RUNTIME_DB_TYPE'] = '{db_type}'
     db_path = r'{db_path}'
     
-    if '{db_type}' == 'neo4j':
-        # Clear Neo4j
+    if '{db_type}' in ('neo4j', 'nornic'):
+        # Clear the server-backed graph
         db_mgr = get_database_manager()
         with db_mgr.get_driver().session() as session:
             session.run("MATCH (n) DETACH DELETE n")
@@ -208,8 +208,11 @@ async def main():
 asyncio.run(main())
 """
     
+    # The backend's connection settings come from the caller (the container
+    # fixtures), not from a hard-coded password in this script.
     proc = await asyncio.create_subprocess_exec(
         sys.executable, "-c", cmd,
+        env={**os.environ, **(backend_env or {})},
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE
     )
@@ -223,8 +226,8 @@ asyncio.run(main())
         print(f"[{db_type} STDERR]:\n{stderr.decode()}", file=sys.stderr)
         
     if proc.returncode != 0:
-        if db_type == "neo4j" and (b"Neo4jConnectionError" in stderr or b"failed to connect" in stderr.lower()):
-            raise ConnectionError("Neo4j connection failed to connect.")
+        if db_type in ("neo4j", "nornic") and (b"Neo4jConnectionError" in stderr or b"failed to connect" in stderr.lower()):
+            raise ConnectionError(f"{db_type} connection failed to connect.")
         raise RuntimeError(f"Indexing process failed for {db_type} with exit code {proc.returncode}")
         
     # Extract stats from stdout
@@ -250,21 +253,23 @@ asyncio.run(main())
     return duration, stats, calls_edges, contains_edges, variable_nodes
 
 
-@pytest.mark.e2e
 @pytest.mark.slow
-def test_database_parity_e2e(temp_test_dir):
-    asyncio.run(_run_database_parity_e2e(temp_test_dir))
+def test_database_parity_e2e(temp_test_dir, request):
+    asyncio.run(_run_database_parity_e2e(temp_test_dir, request))
 
 
-async def _run_database_parity_e2e(temp_test_dir):
+def _backend_env(db_type, request):
+    """Connection settings for a server-backed leg; embedded legs need none."""
+    if request is None or db_type not in ("neo4j", "nornic"):
+        return {}
+    return request.getfixturevalue(f"{db_type}_env")
+
+
+async def _run_database_parity_e2e(temp_test_dir, request=None):
     """
-    Run indexing against KuzuDB, LadybugDB, FalkorDB Lite, and Neo4j
+    Run indexing against KuzuDB, LadybugDB, FalkorDB Lite, Neo4j and NornicDB
     and verify 100% mathematical parity across all extracted nodes and relationships.
     """
-    os.environ.setdefault('NEO4J_URI', 'bolt://localhost:7687')
-    os.environ.setdefault('NEO4J_USERNAME', 'neo4j')
-    os.environ.setdefault('NEO4J_PASSWORD', '12345678')
-    
     import importlib.util
     # FalkorDB Lite 的可用性由产品自身判定：Unix + Python >= 3.12 + redislite.falkordb_client，
     # Windows 明确不支持。仅凭 pip 包存在就排入待跑，会经 get_database_manager 的
@@ -273,15 +278,17 @@ async def _run_database_parity_e2e(temp_test_dir):
         from codegraphcontext.core import is_falkordb_usable
     except Exception:
         is_falkordb_usable = None
-    project_path = Path("tests/fixtures/sample_projects").resolve()
+    # Index a copy: indexing writes a .cgcignore into the directory it scans.
+    project_path = temp_test_dir / "sample_projects"
+    shutil.copytree(Path("tests/fixtures/sample_projects").resolve(), project_path)
     
     db_types_to_run = []
     # 收集每个后端被跳过的原因。全部跳过后并入 test 级 skip 消息 ——
     # 本文件在跳过的用例上不会把 print 输出到 CI 日志，只有把原因交给
     # pytest.skip() 才能在 `pytest -rs` 下被审计到，避免"跳过理由不可信"。
     skip_reasons = []
-    pkg_map = {"kuzudb": "kuzu", "ladybugdb": "ladybug", "falkordb": "falkordb", "neo4j": "neo4j"}
-    for db in ["kuzudb", "ladybugdb", "falkordb", "neo4j"]:
+    pkg_map = {"kuzudb": "kuzu", "ladybugdb": "ladybug", "falkordb": "falkordb", "neo4j": "neo4j", "nornic": "neo4j"}
+    for db in ["kuzudb", "ladybugdb", "falkordb", "neo4j", "nornic"]:
         if importlib.util.find_spec(pkg_map[db]) is None:
             reason = f"{db}: {pkg_map[db]} driver not installed."
             print(f"Skipping {reason}")
@@ -328,22 +335,19 @@ async def _run_database_parity_e2e(temp_test_dir):
     db_types = db_types_to_run
     results = {}
     
+    # A server-backed leg that cannot run is a failure, not a skip: the
+    # containers are part of what this suite verifies.
     for db_type in db_types:
-        try:
-            duration, stats, calls_edges, contains_edges, variable_nodes = await run_indexing_in_process(db_type, project_path, temp_test_dir)
-            results[db_type] = {
-                "duration": duration,
-                "stats": stats,
-                "calls_edges": calls_edges,
-                "contains_edges": contains_edges,
-                "variable_nodes": variable_nodes,
-            }
-        except Exception as e:
-            if db_type == "neo4j" and "failed to connect" in str(e).lower():
-                pytest.skip("Neo4j server is not running/available. "
-                            "Skipped backends -> " + ("; ".join(skip_reasons) if skip_reasons else "(none recorded)"))
-            raise e
-            
+        duration, stats, calls_edges, contains_edges, variable_nodes = await run_indexing_in_process(
+            db_type, project_path, temp_test_dir, _backend_env(db_type, request))
+        results[db_type] = {
+            "duration": duration,
+            "stats": stats,
+            "calls_edges": calls_edges,
+            "contains_edges": contains_edges,
+            "variable_nodes": variable_nodes,
+        }
+
     # Compile comparison and assert parity
     print("\n================= E2E PARITY TEST REPORT =================")
     header_dbs = "".join(f"{db.title():<10} | " for db in db_types)
