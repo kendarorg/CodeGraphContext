@@ -20,8 +20,9 @@ after `writer.write_function_call_groups()`.
 
 from __future__ import annotations
 
+import re
 import time
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from ....utils.debug_log import info_logger
 from ..persistence.utils import get_backend_type, execute_read_operation, execute_write_operation
@@ -33,6 +34,78 @@ _TIER_INHERIT = 10
 # Tier 11: inheritance + embedding similarity
 _TIER_EMBED_CONFIDENCE = 0.82
 _TIER_EMBED = 11
+
+# Receiver of a call such as `numberQueue.enqueue(1)`: a plain identifier before the last dot.
+_IDENTIFIER = re.compile(r"[A-Za-z_$][\w$]*")
+# Initializer that constructs a type: `new Queue<number>()`, `Queue(3)`, `ns.Queue()`.
+_CONSTRUCTED_TYPE = re.compile(r"\s*(?:new\s+)?([A-Za-z_$][\w$.]*)\s*(?:<.*>)?\s*\(")
+
+
+def _receiver_of(full_call_name: Any) -> Optional[str]:
+    """The receiver identifier of a call, or None (e.g. `this.q.push` or a bare call)."""
+    if not full_call_name:
+        return None
+    head = str(full_call_name).split("(", 1)[0].strip()
+    if "." not in head:
+        return None
+    receiver = head.rsplit(".", 1)[0].strip()
+    return receiver if _IDENTIFIER.fullmatch(receiver) else None
+
+
+def _constructed_type(value: Any) -> Optional[str]:
+    """The class a variable initializer constructs, or None.
+
+    Only a capitalised last name counts as a type, so `x = factory.make(1)` gives no type.
+    """
+    if not value:
+        return None
+    match = _CONSTRUCTED_TYPE.match(str(value))
+    if not match:
+        return None
+    name = match.group(1).rsplit(".", 1)[-1]
+    return name if name[:1].isupper() else None
+
+
+def _receiver_type(row: Dict[str, Any], decls: Dict[Tuple[str, str], List[Tuple[int, str]]]) -> Optional[str]:
+    """Declared type of the receiver of a low-confidence call, or None when unknown.
+
+    ``decls`` maps (variable name, path) to [(line_number, value)] sorted by line. The
+    declaration used is the last one at or before the call line (the nearest preceding one).
+    """
+    receiver = _receiver_of(row.get("full_call_name"))
+    if receiver is None:
+        return None
+    entries = decls.get((receiver, row["caller_path"]))
+    if not entries:
+        return None
+    call_line = row.get("call_line")
+    chosen = None
+    for line, value in entries:
+        if call_line is None or line <= call_line:
+            chosen = value
+    return _constructed_type(chosen)
+
+
+def _row_order_key(row: Dict[str, Any]) -> Tuple[Any, ...]:
+    """Fixed order for phase-5 rows, independent of the backend's result order."""
+    return (
+        row["caller_path"] or "",
+        row["caller_name"] or "",
+        row["caller_line"] or 0,
+        row["call_line"] or 0,
+        row["called_name"] or "",
+    )
+
+
+def _candidate_order(impl: Dict[str, Any]) -> Tuple[Any, ...]:
+    """Fixed order for candidate implementations: path, then line, then class."""
+    line = impl.get("line_number")
+    return (
+        impl.get("path") or "",
+        line if line is not None else -1,
+        impl.get("class_name") or "",
+        impl.get("parent_name") or "",
+    )
 
 
 def run_inheritance_reresolve(
@@ -85,6 +158,10 @@ def run_inheritance_reresolve(
     if not low_confidence:
         return 0
 
+    # The last row applied sets the call line of the one CALLS edge per (caller, callee),
+    # so the row order must not depend on the backend.
+    low_confidence = sorted(low_confidence, key=_row_order_key)
+
     # Step 2: batch-fetch all candidate implementations in a single query.
     # Using UNWIND + IN instead of N separate round-trips prevents session
     # timeouts on large repos and is orders-of-magnitude faster.
@@ -126,6 +203,50 @@ def run_inheritance_reresolve(
 
         name_to_impls.update(execute_read_operation(driver, backend, _read_work_2))
 
+    # Candidates in a fixed order, whatever order the backend returned them in.
+    for impls in name_to_impls.values():
+        impls.sort(key=_candidate_order)
+
+    # Step 2b: declared receiver types. For each (receiver, caller file) pair named by a
+    # low-confidence call, read the Variable declarations of that name in that file.
+    receiver_keys: Set[Tuple[str, str]] = set()
+    for row in low_confidence:
+        receiver = _receiver_of(row.get("full_call_name"))
+        if receiver is not None and row["caller_path"]:
+            receiver_keys.add((receiver, row["caller_path"]))
+
+    decls: Dict[Tuple[str, str], List[Tuple[int, str]]] = {}
+    if symbol_index is not None:
+        for name, path in receiver_keys:
+            for entry in symbol_index.entries("Variable", name, path):
+                decls.setdefault((name, path), []).append((entry.line_number or 0, entry.value))
+    elif receiver_keys:
+        backend = get_backend_type(driver)
+        receiver_pairs = [{"name": name, "path": path} for name, path in sorted(receiver_keys)]
+
+        def _read_work_var(session):
+            local_decls: Dict[Tuple[str, str], List[Tuple[int, str]]] = {}
+            for _i in range(0, len(receiver_pairs), _NAMES_BATCH):
+                chunk = receiver_pairs[_i : _i + _NAMES_BATCH]
+                result = session.run(
+                    """
+                    UNWIND $pairs AS p
+                    MATCH (v:Variable {name: p.name, path: p.path})
+                    RETURN v.name AS name, v.path AS path,
+                           v.line_number AS line_number, v.value AS value
+                    """,
+                    pairs=chunk,
+                )
+                for row in result:
+                    local_decls.setdefault((row["name"], row["path"]), []).append(
+                        (row["line_number"] or 0, row["value"] or "")
+                    )
+            return local_decls
+
+        decls.update(execute_read_operation(driver, backend, _read_work_var))
+    for entries in decls.values():
+        entries.sort()
+
     # Step 3: for each low-confidence edge, check if INHERITS narrows candidates
     # Strategy:
     #   a) If only 1 candidate exists across the entire repo → use it (tier 10)
@@ -151,7 +272,15 @@ def run_inheritance_reresolve(
         confidence = _TIER_INHERIT_CONFIDENCE
         tier = _TIER_INHERIT
 
-        if len(candidates) == 1:
+        receiver_type = _receiver_type(row, decls)
+        typed = [c for c in candidates if receiver_type and c.get("class_name") == receiver_type]
+
+        if typed:
+            # The receiver's declared type names the class: `numberQueue` built with
+            # `new Queue()` takes Queue.enqueue, not another class's enqueue.
+            best_path = typed[0]["path"]
+            best_line = typed[0].get("line_number")
+        elif len(candidates) == 1:
             # Unambiguous: single implementation outside the caller file
             best_path = candidates[0]["path"]
             best_line = candidates[0].get("line_number")
@@ -203,7 +332,7 @@ def run_inheritance_reresolve(
 
     # Repo init on KùzuDB: the Cypher MERGE below cannot create a CALLS edge with
     # unlabelled endpoints, so the edges are deleted and COPYed in bulk instead.
-    if symbol_index is not None and backend == "kuzudb":
+    if symbol_index is not None and backend in ("kuzudb", "ladybugdb"):
         from ..persistence.bulk_kuzu import apply_inherit_reresolve, pyarrow_available
 
         if pyarrow_available():

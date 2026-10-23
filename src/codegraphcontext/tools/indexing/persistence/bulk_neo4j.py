@@ -179,3 +179,83 @@ def _write_imports(session: Any, import_edges: Dict[Tuple[Any, ...], Dict[str, A
         session.run(js_query, batch=batch)
     for batch in _batches(other_rows):
         session.run(other_query, batch=batch)
+
+
+# ── ORM, query and MyBatis links ─────────────────────────────────────────────
+# These run after the node flush, so their endpoints already exist. The queries are
+# the ones the standard writers run (writer.write_orm_mappings, write_query_links,
+# write_mybatis_links), with the same MATCH and MERGE keys, in UNWIND batches.
+
+_MAPS_TO_QUERY = """
+    UNWIND $batch AS m
+    MATCH (c:Class {name: m.class_name, path: m.class_path})
+    MERGE (tbl:DbTable {fqn: m.orm_table})
+    SET tbl.name = m.orm_table,
+        tbl.datasource_name = COALESCE(tbl.datasource_name, m.datastore)
+    MERGE (c)-[:MAPS_TO {datastore: m.datastore, line_number: m.line_number}]->(tbl)
+"""
+
+# READS / WRITES from @Query methods: the standard MERGE carries line_number.
+_QUERY_EDGE_QUERY = """
+    UNWIND $batch AS q
+    MATCH (fn:Function {name: q.method_name, path: q.method_path})
+    MERGE (tbl:DbTable {fqn: q.table_name})
+    SET tbl.name = q.table_name,
+        tbl.datasource_name = COALESCE(tbl.datasource_name, 'mysql')
+    MERGE (fn)-[:%s {line_number: q.line_number}]->(tbl)
+"""
+
+# READS / WRITES from MyBatis mappers: the standard MERGE has no line_number, so an
+# existing edge of the same type between the function and the table is reused.
+_MYBATIS_EDGE_QUERY = """
+    UNWIND $batch AS q
+    MATCH (fn:Function {name: q.method_name, path: q.method_path})
+    MERGE (tbl:DbTable {fqn: q.table_name})
+    SET tbl.name = q.table_name,
+        tbl.datasource_name = COALESCE(tbl.datasource_name, 'mysql')
+    MERGE (fn)-[:%s]->(tbl)
+"""
+
+
+def write_maps_to(session: Any, class_table_rows: List[Dict[str, Any]]) -> None:
+    """MAPS_TO edges Class -> DbTable from class_table ORM rows."""
+    rows = [
+        {
+            "class_name": r.get("class_name"),
+            "class_path": r.get("class_path"),
+            "orm_table": r.get("orm_table"),
+            "datastore": r.get("datastore"),
+            "line_number": r.get("line_number"),
+        }
+        for r in class_table_rows
+        if r.get("kind") == "class_table"
+    ]
+    for batch in _batches(rows):
+        session.run(_MAPS_TO_QUERY, batch=batch)
+
+
+def write_function_table_edges(
+    session: Any,
+    edges: List[Dict[str, Any]],
+    *,
+    with_line_number: bool,
+) -> None:
+    """READS / WRITES edges Function -> DbTable. ``edges`` are the dicts the standard
+    writers build: method_name, method_path, table_name, operation, line_number."""
+    for operation in ("READS", "WRITES"):
+        op_rows = [
+            {
+                "method_name": e["method_name"],
+                "method_path": e["method_path"],
+                "table_name": e["table_name"],
+                **({"line_number": e.get("line_number", 0)} if with_line_number else {}),
+            }
+            for e in edges
+            if e["operation"] == operation
+        ]
+        if not op_rows:
+            continue
+        template = _QUERY_EDGE_QUERY if with_line_number else _MYBATIS_EDGE_QUERY
+        query = template % operation
+        for batch in _batches(op_rows):
+            session.run(query, batch=batch)

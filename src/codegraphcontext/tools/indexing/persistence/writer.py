@@ -24,6 +24,7 @@ from ..symbol_index import (
     add_inherit_edges,
     kuzu_uid,
 )
+from . import bulk_neo4j as neo4j_bulk
 from .bulk_kuzu import (
     CALL_REL_PROPERTIES,
     build_call_edges,
@@ -360,6 +361,8 @@ def _import_rows(file_data: Dict[str, Any], lang: Optional[str]) -> Tuple[List[D
 
 # Embedded backends that share the Kùzu schema and COPY bulk path (bulk_kuzu).
 _EMBEDDED_BULK_BACKENDS = ("kuzudb", "ladybugdb")
+# Neo4j-protocol servers: driver-side UNWIND batches (bulk_neo4j.py). NornicDB speaks Bolt.
+_NEO4J_BULK_BACKENDS = ("neo4j", "nornic")
 
 
 class GraphWriter:
@@ -387,7 +390,7 @@ class GraphWriter:
         The collector class decides the flush, so flush_bulk needs no backend branch.
         """
         backend = get_backend_type(self.driver, self._db_manager)
-        if backend == "neo4j":
+        if backend in _NEO4J_BULK_BACKENDS:
             from .bulk_neo4j import Neo4jBulkCollector
 
             self._bulk = Neo4jBulkCollector()
@@ -424,6 +427,11 @@ class GraphWriter:
             and backend in _EMBEDDED_BULK_BACKENDS
             and pyarrow_available()
         )
+
+    def _use_neo4j_bulk(self, backend: str) -> bool:
+        """True in repo init on Neo4j: the ORM, query and MyBatis links are written with
+        UNWIND batches (bulk_neo4j) after the node flush, with the standard MERGE keys."""
+        return self._symbol_index is not None and backend in _NEO4J_BULK_BACKENDS
 
     def _get_all_node_labels(self) -> list[str]:
         """Discover all node labels in the database, backend-aware.
@@ -1070,6 +1078,7 @@ class GraphWriter:
                             key=kuzu_uid(label, b) or b.get("name"),
                             class_context=(b.get("class_context") or "") if label == "Function" else "",
                             module_context=(b.get("module_context") or "") if label == "Function" else "",
+                            value=(b.get("value") or "") if label == "Variable" else "",
                         ))
 
                 if self._bulk is not None:
@@ -2799,6 +2808,13 @@ class GraphWriter:
             info_logger(f"[ORM] Written {len(class_table)} MAPS_TO edges")
             return
 
+        if self._use_neo4j_bulk(backend):
+            execute_write_operation(
+                self.driver, backend, lambda session: neo4j_bulk.write_maps_to(session, class_table)
+            )
+            info_logger(f"[ORM] Written {len(class_table)} MAPS_TO edges (UNWIND)")
+            return
+
         batch_size = 500
         def _work(session):
             for i in range(0, len(class_table), batch_size):
@@ -2864,6 +2880,15 @@ class GraphWriter:
             info_logger(f"[ORM] Written {len(edges)} READS/WRITES query edges")
             return
 
+        if self._use_neo4j_bulk(backend):
+            execute_write_operation(
+                self.driver,
+                backend,
+                lambda session: neo4j_bulk.write_function_table_edges(session, edges, with_line_number=True),
+            )
+            info_logger(f"[ORM] Written {len(edges)} READS/WRITES query edges (UNWIND)")
+            return
+
         batch_size = 500
         def _work(session):
             for op in ("READS", "WRITES"):
@@ -2925,6 +2950,15 @@ class GraphWriter:
                     )
             execute_write_operation(self.driver, backend, _copy_mybatis_edges)
             info_logger(f"[MYBATIS] Submitted {len(edges)} READS/WRITES MyBatis records")
+            return
+
+        if self._use_neo4j_bulk(backend):
+            execute_write_operation(
+                self.driver,
+                backend,
+                lambda session: neo4j_bulk.write_function_table_edges(session, edges, with_line_number=False),
+            )
+            info_logger(f"[MYBATIS] Submitted {len(edges)} READS/WRITES MyBatis records (UNWIND)")
             return
 
         batch_size = 500

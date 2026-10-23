@@ -27,6 +27,9 @@ class NodeEntry:
     key: Optional[str]
     name: str = ""
     path: str = ""
+    # Variable nodes only: the initializer text (the `value` property), used by phase 5
+    # to read a receiver's declared type.
+    value: str = ""
 
 
 @dataclass(frozen=True)
@@ -82,6 +85,7 @@ class SymbolIndex:
         key: Optional[str] = None,
         class_context: str = "",
         module_context: str = "",
+        value: str = "",
     ) -> None:
         """Record a node the writer has just written."""
         self._labels.add(label)
@@ -94,6 +98,7 @@ class SymbolIndex:
             key=key,
             name=name,
             path=path,
+            value=value or "",
         )
         self._by_name_path.setdefault((name, path), []).append(entry)
         self._by_name.setdefault(name, []).append(entry)
