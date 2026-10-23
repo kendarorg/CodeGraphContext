@@ -169,6 +169,73 @@ def _get_embedder(model_spec: Optional[str] = None):
     return _LocalEmbedder(spec)
 
 
+def load_embedder(model_spec: Optional[str] = None) -> Tuple[Optional[Any], Optional[str]]:
+    """Probe the backend and load the embedder. Returns ``(embedder, None)`` or ``(None, reason)``."""
+    ok, detail = probe_embedding_backend(model_spec)
+    if not ok:
+        return None, detail
+    try:
+        return _get_embedder(model_spec), None
+    except Exception as e:
+        return None, f"embedding model could not be loaded: {e}"
+
+
+def db_text_fields(fn: Dict[str, Any]) -> Dict[str, Any]:
+    """Reduce a parsed Function record to the fields the database path embeds.
+
+    The database path reads ``parameters`` (defaulting to an empty list), never
+    ``args``, so the in-memory path must not fall back to ``args`` either.
+    """
+    return {
+        "name": fn.get("name"),
+        "qualified_name": fn.get("qualified_name"),
+        "docstring": fn.get("docstring"),
+        "parameters": fn.get("parameters") or [],
+    }
+
+
+def embed_functions_in_memory(
+    functions: List[Dict[str, Any]],
+    model_spec: Optional[str] = None,
+    batch_size: int = 256,
+    embedder: Optional[Any] = None,
+) -> Tuple[Dict[int, List[float]], Optional[str]]:
+    """Embed parsed Function records without reading or writing the database.
+
+    Text is built from the same fields the database path embeds (see
+    ``db_text_fields``). Returns ``({index: vector}, skip_reason)``. When no
+    embedding backend or model is available, nothing is embedded: the reason is
+    logged and returned, and the mapping is empty. A pre-loaded ``embedder`` skips
+    the probe and the model load.
+    """
+    if embedder is None:
+        embedder, reason = load_embedder(model_spec)
+        if embedder is None:
+            warning_logger(f"[EMBED] Skipping in-memory embeddings: {reason}")
+            return {}, reason
+
+    vectors: Dict[int, List[float]] = {}
+    n_batches = (len(functions) + batch_size - 1) // batch_size
+    for batch_num, start in enumerate(range(0, len(functions), batch_size), start=1):
+        indices = list(range(start, min(start + batch_size, len(functions))))
+        texts = [_build_text(db_text_fields(functions[i])) for i in indices]
+        try:
+            batch_vectors = embedder.embed_batch(texts)
+        except Exception as e:
+            error_logger(f"[EMBED] In-memory batch {batch_num}/{n_batches} failed: {e}")
+            continue
+        if len(batch_vectors) != len(indices):
+            warning_logger(
+                f"[EMBED] In-memory batch {batch_num}/{n_batches} length mismatch: "
+                f"got {len(batch_vectors)} vectors for {len(indices)} inputs; skipping batch"
+            )
+            continue
+        for i, vec in zip(indices, batch_vectors):
+            vectors[i] = vec
+    info_logger(f"[EMBED] In-memory embeddings: {len(vectors)}/{len(functions)} functions")
+    return vectors, None
+
+
 class EmbeddingPipeline:
     """Reads Function nodes, generates embeddings, and writes them back."""
 

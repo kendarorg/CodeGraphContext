@@ -29,6 +29,7 @@ from . import project_config
 # Import the new helper functions
 from .cli_helpers import (
     index_helper,
+    repo_init_helper,
     add_package_helper,
     list_repos_helper,
     delete_helper,
@@ -1695,6 +1696,7 @@ def index(
     context: Optional[str] = typer.Option(None, "--context", "-c", help="Specific context to use (overrides mode/default)"),
     summarize: bool = typer.Option(False, "--summarize", "-s", help="Show a summary of the indexed codebase after indexing"),
     no_progress: bool = typer.Option(False, "--no-progress", help="Disable live progress rendering during indexing."),
+    repo_init: bool = typer.Option(False, "--repo-init", help="Index into an empty graph with the in-memory symbol index (fails if the repository is already indexed)."),
 ):
     """
     Indexes a directory or file by adding it to the code graph.
@@ -1702,13 +1704,19 @@ def index(
 
     Use --force to delete the existing index and rebuild from scratch.
     Use --summarize to display a summary after indexing.
+    Use --repo-init to index a repository that has no graph data yet.
     """
     _load_credentials()
     if path is None:
         path = str(Path.cwd())
 
     try:
-        if force:
+        if repo_init:
+            if force:
+                console.print("[red]--repo-init cannot be combined with --force.[/red]")
+                raise typer.Exit(code=2)
+            repo_init_helper(path, context)
+        elif force:
             console.print("[yellow]Force re-indexing (--force flag detected)[/yellow]")
             reindex_helper(path, context, no_progress=no_progress)
         else:
@@ -3482,7 +3490,7 @@ def index_abbrev(
     """Shortcut for 'cgc index'"""
     # `summarize` must be passed explicitly: omitted, it keeps its OptionInfo
     # sentinel, which is truthy — so `cgc i` always printed the summary.
-    index(path, force=force, summarize=summarize, context=context, no_progress=no_progress)
+    index(path, force=force, summarize=summarize, context=context, no_progress=no_progress, repo_init=False)
 
 @app.command("ls", rich_help_panel="Shortcuts")
 def list_abbrev(

@@ -42,6 +42,15 @@ WATCHER_DEFAULT_PARALLEL_WORKERS = 4
 MAX_PARALLEL_WORKERS = 32
 
 
+def repo_init_embed_wanted(vector_on: bool, inherit_on: bool) -> bool:
+    """Repo-init phase 4 runs only when its vectors will be read.
+
+    The vectors are consumed only by the phase 5 tiebreak, so embedding is
+    pointless unless ENABLE_INHERIT_RESOLVE is also on.
+    """
+    return bool(vector_on and inherit_on)
+
+
 def _clamp_parallel_workers(workers: int) -> int:
     """Cap a resolved worker count. A config of 5000 must not spawn 5000 threads."""
     if workers > MAX_PARALLEL_WORKERS:
@@ -264,6 +273,11 @@ async def run_tree_sitter_index_async(
                 file_data["error"] = str(exc)
                 file_data["parse_failed"] = True
 
+    if writer.bulk_enabled:
+        # Bulk mode (repo init): nodes, file CONTAINS edges and side rows are written now.
+        info_logger("[BULK] Writing collected nodes...")
+        await asyncio.to_thread(writer.flush_bulk)
+
     if write_failures:
         warning_logger(
             f"{len(write_failures)} file(s) could not be written to the graph; "
@@ -448,7 +462,45 @@ async def run_tree_sitter_index_async(
     # ── Phase 4: embedding generation (optional, config-gated) ────────────────
     from ...cli.config_manager import get_config_value as _gcv
     embed_warning: Optional[str] = None
-    if (_gcv("ENABLE_VECTOR_RESOLVE") or "false").lower() == "true":
+    # Repo init keeps relationship lookups in memory; the embedding phase still
+    # reads the database, so it is skipped until it is index-backed.
+    repo_init_mode = getattr(writer, "_symbol_index", None) is not None
+    # Repo init: embed the parsed Function records in memory and keep the vectors
+    # for the phase 5 tiebreak. Nothing is written to the graph; phase 5 is the only
+    # reader and it runs in this process.
+    repo_init_embeddings = None  # (embedder, records, {index: vector})
+    _vector_on = (_gcv("ENABLE_VECTOR_RESOLVE") or "false").lower() == "true"
+    _inherit_on = (_gcv("ENABLE_INHERIT_RESOLVE") or "false").lower() == "true"
+    if repo_init_mode and repo_init_embed_wanted(_vector_on, _inherit_on):
+        from .embeddings import embed_functions_in_memory, load_embedder
+
+        embedder, _load_reason = await asyncio.to_thread(load_embedder)
+        if embedder is None:
+            embed_warning = f"ENABLE_VECTOR_RESOLVE=true but embeddings were NOT generated: {_load_reason}"
+            error_logger(f"[EMBED] {embed_warning}")
+        else:
+            if job_id:
+                job_manager.update_job(job_id, status_message="Generating embeddings...")
+            # Same path the database rows and the symbol index use: functions carry
+            # no "path" key of their own, the writer sets it from the file.
+            from .persistence.writer import _normalize_path
+
+            repo_init_records = [
+                {**fn, "path": _normalize_path(fd["path"])}
+                for fd in all_file_data
+                for fn in (fd.get("functions") or [])
+            ]
+            info_logger(f"[EMBED] Repo init: embedding {len(repo_init_records)} functions in memory")
+            vectors, _ = await asyncio.to_thread(
+                embed_functions_in_memory, repo_init_records, None, 256, embedder
+            )
+            repo_init_embeddings = (embedder, repo_init_records, vectors)
+    elif repo_init_mode and _vector_on:
+        info_logger(
+            "[EMBED] Repo init: skipping embeddings, ENABLE_INHERIT_RESOLVE is off "
+            "(vectors are only read by the phase 5 tiebreak)"
+        )
+    elif _vector_on:
         # Probe first: with no backend installed the pipeline used to fail
         # inside a swallowed except at a log level that is off by default,
         # so 'vector resolve is working' and 'vector resolve has never run'
@@ -481,16 +533,26 @@ async def run_tree_sitter_index_async(
         try:
             from .resolution.post_resolution import run_inheritance_reresolve
             repo_path_str = path.resolve().as_posix()
+            # Repo init reads the edges and candidates from the in-memory index.
+            symbol_index = getattr(writer, "_symbol_index", None)
 
             def reresolve_inheritance():
                 vector_resolver = None
-                if (_gcv("ENABLE_VECTOR_RESOLVE") or "false").lower() == "true":
+                if symbol_index is not None:
+                    # Repo init: tiebreak over the vectors phase 4 held in memory.
+                    if repo_init_embeddings is not None:
+                        from .vector_resolver import InMemoryVectorResolver
+                        _emb, _recs, _vecs = repo_init_embeddings
+                        vector_resolver = InMemoryVectorResolver.from_function_records(_emb, _recs, _vecs)
+                elif (_gcv("ENABLE_VECTOR_RESOLVE") or "false").lower() == "true":
                     try:
                         from .vector_resolver import VectorResolver
                         vector_resolver = VectorResolver(writer.driver)
                     except Exception as _ve:
                         info_logger(f"[VECTOR] Resolver unavailable: {_ve}")
-                return run_inheritance_reresolve(writer.driver, repo_path_str, vector_resolver)
+                return run_inheritance_reresolve(
+                    writer.driver, repo_path_str, vector_resolver, symbol_index=symbol_index,
+                )
 
             improved = await asyncio.to_thread(reresolve_inheritance)
             info_logger(f"[INHERIT-RESOLVE] Post-resolution complete: {improved} edges improved")

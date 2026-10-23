@@ -23,7 +23,7 @@ from __future__ import annotations
 import time
 from typing import Any, Dict, List, Optional, Set
 
-from ....utils.debug_log import info_logger, warning_logger
+from ....utils.debug_log import info_logger
 from ..persistence.utils import get_backend_type, execute_read_operation, execute_write_operation
 
 # Tier 10: resolved via inheritance graph (better than tier 8 first-match bias)
@@ -39,8 +39,12 @@ def run_inheritance_reresolve(
     driver: Any,
     repo_path: str,
     vector_resolver: Optional[Any] = None,
+    symbol_index: Optional[Any] = None,
 ) -> int:
     """Re-resolve low-confidence CALLS / HEURISTIC_CALLS edges using INHERITS graph + optional embeddings.
+
+    With ``symbol_index`` (repo init), the two reads come from the in-memory index
+    and the writes still go to ``driver``. Without it, both reads query the database.
 
     Returns the number of edges that were improved.
     """
@@ -54,25 +58,28 @@ def run_inheritance_reresolve(
     # Step 1: find all low-confidence same-file CALLS / HEURISTIC_CALLS edges (tier 8 or 9)
     # These are edges where the resolver gave up and pointed to the caller's file.
     backend = get_backend_type(driver)
-    def _read_work_1(session):
-        return list(session.run(
-            """
-            MATCH (caller)-[c:CALLS|HEURISTIC_CALLS]->(called)
-            WHERE (caller.path STARTS WITH $repo_path_prefix
-                   OR called.path STARTS WITH $repo_path_prefix)
-              AND c.resolution_tier IN [8, 9]
-            RETURN
-                caller.name AS caller_name,
-                caller.path AS caller_path,
-                caller.line_number AS caller_line,
-                called.name AS called_name,
-                c.line_number AS call_line,
-                c.full_call_name AS full_call_name,
-                c.args AS args
-            """,
-            repo_path_prefix=repo_path_prefix,
-        ))
-    low_confidence = execute_read_operation(driver, backend, _read_work_1)
+    if symbol_index is not None:
+        low_confidence = symbol_index.low_confidence_call_rows(repo_path_prefix)
+    else:
+        def _read_work_1(session):
+            return list(session.run(
+                """
+                MATCH (caller)-[c:CALLS|HEURISTIC_CALLS]->(called)
+                WHERE (caller.path STARTS WITH $repo_path_prefix
+                       OR called.path STARTS WITH $repo_path_prefix)
+                  AND c.resolution_tier IN [8, 9]
+                RETURN
+                    caller.name AS caller_name,
+                    caller.path AS caller_path,
+                    caller.line_number AS caller_line,
+                    called.name AS called_name,
+                    c.line_number AS call_line,
+                    c.full_call_name AS full_call_name,
+                    c.args AS args
+                """,
+                repo_path_prefix=repo_path_prefix,
+            ))
+        low_confidence = execute_read_operation(driver, backend, _read_work_1)
 
     info_logger(f"[INHERIT-RESOLVE] Found {len(low_confidence)} low-confidence edges to re-examine")
     if not low_confidence:
@@ -90,30 +97,34 @@ def run_inheritance_reresolve(
 
     _NAMES_BATCH = 500  # stay well under Cypher parameter-list limits
     unique_names_list = list(unique_names)
-    backend = get_backend_type(driver)
-    def _read_work_2(session):
-        local_impls = {}
-        for _i in range(0, len(unique_names_list), _NAMES_BATCH):
-            chunk = unique_names_list[_i : _i + _NAMES_BATCH]
-            result = session.run(
-                """
-                UNWIND $names AS name
-                MATCH (cls:Class)-[:CONTAINS]->(fn:Function {name: name})
-                WHERE fn.path STARTS WITH $repo_path_prefix
-                OPTIONAL MATCH (cls)-[:INHERITS]->(parent:Class)
-                RETURN fn.name AS queried_name, fn.path AS path,
-                       fn.line_number AS line_number,
-                       cls.name AS class_name, cls.qualified_name AS class_qname,
-                       parent.name AS parent_name, parent.qualified_name AS parent_qname
-                """,
-                names=chunk,
-                repo_path_prefix=repo_path_prefix,
-            )
-            for row in result:
-                local_impls.setdefault(row["queried_name"], []).append(dict(row))
-        return local_impls
-    
-    name_to_impls.update(execute_read_operation(driver, backend, _read_work_2))
+    if symbol_index is not None:
+        for row in symbol_index.class_method_candidate_rows(repo_path_prefix, unique_names_list):
+            name_to_impls.setdefault(row["queried_name"], []).append(dict(row))
+    else:
+        backend = get_backend_type(driver)
+        def _read_work_2(session):
+            local_impls = {}
+            for _i in range(0, len(unique_names_list), _NAMES_BATCH):
+                chunk = unique_names_list[_i : _i + _NAMES_BATCH]
+                result = session.run(
+                    """
+                    UNWIND $names AS name
+                    MATCH (cls:Class)-[:CONTAINS]->(fn:Function {name: name})
+                    WHERE fn.path STARTS WITH $repo_path_prefix
+                    OPTIONAL MATCH (cls)-[:INHERITS]->(parent:Class)
+                    RETURN fn.name AS queried_name, fn.path AS path,
+                           fn.line_number AS line_number,
+                           cls.name AS class_name, cls.qualified_name AS class_qname,
+                           parent.name AS parent_name, parent.qualified_name AS parent_qname
+                    """,
+                    names=chunk,
+                    repo_path_prefix=repo_path_prefix,
+                )
+                for row in result:
+                    local_impls.setdefault(row["queried_name"], []).append(dict(row))
+            return local_impls
+
+        name_to_impls.update(execute_read_operation(driver, backend, _read_work_2))
 
     # Step 3: for each low-confidence edge, check if INHERITS narrows candidates
     # Strategy:
@@ -188,8 +199,24 @@ def run_inheritance_reresolve(
 
     info_logger(f"[INHERIT-RESOLVE] Re-resolving {len(improvements)} edges...")
 
-    batch_size = 500
     backend = get_backend_type(driver)
+
+    # Repo init on KùzuDB: the Cypher MERGE below cannot create a CALLS edge with
+    # unlabelled endpoints, so the edges are deleted and COPYed in bulk instead.
+    if symbol_index is not None and backend == "kuzudb":
+        from ..persistence.bulk_kuzu import apply_inherit_reresolve, pyarrow_available
+
+        if pyarrow_available():
+            def _bulk_write_work(session):
+                apply_inherit_reresolve(session, symbol_index, improvements)
+
+            execute_write_operation(driver, backend, _bulk_write_work)
+            info_logger(
+                f"[INHERIT-RESOLVE] Improved {len(improvements)} CALLS / HEURISTIC_CALLS edges in {time.time()-t0:.1f}s"
+            )
+            return len(improvements)
+
+    batch_size = 500
 
     def _make_write_query(caller_has_line: bool, called_has_line: bool) -> str:
         # Every literal Cypher map here needs doubled braces — this is an

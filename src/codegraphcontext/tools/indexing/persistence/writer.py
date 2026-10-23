@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 import time
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -14,6 +15,41 @@ from ....utils.git_utils import get_repo_commit_hash
 from ..sanitize import sanitize_props as sanitize_props
 from ..sanitize import sanitize_props_with_secrets
 from ..schema_contract import NODE_LABELS
+from ..symbol_index import (
+    SymbolIndex,
+    add_call_edges,
+    add_contains_edges,
+    add_cpp_class_function_edges,
+    add_csharp_inherit_edges,
+    add_inherit_edges,
+    kuzu_uid,
+)
+from .bulk_kuzu import (
+    CALL_REL_PROPERTIES,
+    build_call_edges,
+    build_binds_edges,
+    build_decorated_edges,
+    build_external_inherit_edges,
+    build_function_table_edges,
+    build_maps_to_edges,
+    build_companion_of_edges,
+    build_embeds_edges,
+    build_implements_edges,
+    build_inclusion_edges,
+    build_inject_edges,
+    build_part_of_edges,
+    build_partial_of_edges,
+    build_previews_edges,
+    build_inherit_edges,
+    build_metaclass_edges,
+    copy_grouped_edges,
+    copy_rel_rows,
+    declared_bindings,
+    load_db_tables,
+    load_external_classes,
+    load_maven_graph,
+    pyarrow_available,
+)
 from .utils import get_backend_type, execute_write_operation, execute_read_operation
 
 
@@ -97,6 +133,28 @@ def _normalize_path(p) -> str:
 def _normalize_prefix(p) -> str:
     """Return a normalized path prefix ending with '/' for STARTS WITH queries."""
     return _normalize_path(p) + "/"
+
+
+def _directory_chain(
+    repo_root: str, dir_parts: Tuple[str, ...], file_path: str
+) -> Tuple[List[Tuple[str, str]], List[Tuple[str, str, str, str]]]:
+    """Directory nodes and CONTAINS links from the repository root down to one file.
+
+    Returns ((path, name) per directory, (from label, from path, to label, to path) per link),
+    with the same paths the per-directory MERGE queries computed.
+    """
+    nodes: List[Tuple[str, str]] = []
+    links: List[Tuple[str, str, str, str]] = []
+    parent_path = repo_root
+    parent_label = "Repository"
+    for part in dir_parts:
+        current_path = _normalize_path(Path(parent_path) / part)
+        nodes.append((current_path, part))
+        links.append((parent_label, parent_path, "Directory", current_path))
+        parent_path = current_path
+        parent_label = "Directory"
+    links.append((parent_label, parent_path, "File", file_path))
+    return nodes, links
 
 
 # These labels are deliberately global: one node per name, shared across files.
@@ -197,6 +255,22 @@ def _cypher_label(label: str, backend: str) -> str:
     return label
 
 
+# (caller label, called label) call groups written through the symbol index in repo
+# init. Function -> Parameter and File -> Object are left on their queries: the
+# Parameter predicate references a line_number the table does not have, and the
+# schema declares no File -> Object binding, so those batches never wrote anything.
+_INDEXED_CALL_GROUPS = {
+    ("Function", "Function"),
+    ("Function", "Class"),
+    ("Function", "Interface"),
+    ("Function", "Object"),
+    ("Function", "File"),
+    ("File", "Function"),
+    ("File", "Class"),
+    ("File", "Interface"),
+}
+
+
 def _called_context_clause(called_label: str) -> str:
     """Match CALLS targets that store scope in context, class_context, or module_context.
 
@@ -231,17 +305,125 @@ def _is_binder_exception(e: Exception) -> bool:
 
 
 
+def _import_rows(file_data: Dict[str, Any], lang: Optional[str]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Import rows for one file: (JavaScript IMPORTS rows, other IMPORTS rows)."""
+    js_imports = []
+
+    other_imports = []
+    for imp in file_data.get("imports", []):
+        if lang in {"javascript", "typescript", "tsx"}:
+            module_name = imp.get("source")
+            if module_name:
+                js_imports.append(
+                    {
+                        "module_name": module_name,
+                        "imported_name": imp.get("name", "*"),
+                        "alias": imp.get("alias") or "",
+                        "line_number": imp.get("line_number") or 0,
+                        "lang": imp.get("lang") or lang,
+                    }
+                )
+        else:
+            # Python from-imports keep `name` as the imported symbol
+            # (call resolution) and stash the module in `source`.
+            if lang == "python" and imp.get("source"):
+                module_name = imp.get("source")
+            else:
+                module_name = (
+                    imp.get("name")
+                    or imp.get("source")
+                    or imp.get("full_import_name")
+                )
+            if not module_name:
+                continue
+            full_import_name = (
+                imp.get("full_import_name")
+                or imp.get("source")
+                or module_name
+            )
+            other_imports.append(
+                {
+                    "name": module_name,
+                    "full_import_name": full_import_name,
+                    "imported_name": (
+                        imp.get("imported_name")
+                        or imp.get("name")
+                        or module_name
+                    ),
+                    "alias": imp.get("alias"),
+                    "line_number": imp.get("line_number") or 0,
+                    "lang": imp.get("lang") or lang,
+                }
+            )
+    return js_imports, other_imports
+
+
+# Embedded backends that share the Kùzu schema and COPY bulk path (bulk_kuzu).
+_EMBEDDED_BULK_BACKENDS = ("kuzudb", "ladybugdb")
+
+
 class GraphWriter:
     """Persists repository/file/symbol nodes and relationships via the Neo4j-like driver API."""
 
-    def __init__(self, driver: Any, db_manager: Any = None):
+    def __init__(self, driver: Any, db_manager: Any = None, symbol_index: Optional["SymbolIndex"] = None):
         self.driver = driver
         self._db_manager = db_manager
+        # Set only by the repo-init path. When None, every lookup below runs its
+        # original database query.
+        self._symbol_index = symbol_index
+        # Set by enable_bulk() for repo initialization on KùzuDB. When set, node rows
+        # and side rows are collected and written by flush_bulk() instead of per file.
+        self._bulk = None
         if db_manager is None:
             warning_logger(
                 "[GraphWriter] db_manager not provided; "
                 "backend detection will default to 'neo4j'"
             )
+
+    def enable_bulk(self) -> bool:
+        """Collect rows for a bulk load. Returns False when the backend has no bulk path.
+
+        KùzuDB loads with COPY from Parquet; Neo4j loads with driver-side UNWIND batches.
+        The collector class decides the flush, so flush_bulk needs no backend branch.
+        """
+        backend = get_backend_type(self.driver, self._db_manager)
+        if backend == "neo4j":
+            from .bulk_neo4j import Neo4jBulkCollector
+
+            self._bulk = Neo4jBulkCollector()
+            return True
+        if backend not in _EMBEDDED_BULK_BACKENDS:
+            return False
+        try:
+            import pyarrow  # noqa: F401 - the bulk load writes Parquet
+        except ImportError:
+            warning_logger("[BULK] pyarrow is not installed; using per-file writes.")
+            return False
+        from .bulk_kuzu import BulkCollector
+
+        self._bulk = BulkCollector()
+        return True
+
+    @property
+    def bulk_enabled(self) -> bool:
+        return self._bulk is not None
+
+    def flush_bulk(self) -> None:
+        """Write everything collected by a bulk run, then leave bulk mode."""
+        if self._bulk is None:
+            return
+        bulk, self._bulk = self._bulk, None
+        backend = get_backend_type(self.driver, self._db_manager)
+        execute_write_operation(self.driver, backend, bulk.flush)
+
+    def _use_index_writes(self, backend: str) -> bool:
+        """True in repo init on KùzuDB with a usable bulk loader: relationships are
+        resolved from the symbol index and written with COPY."""
+        return (
+            self._symbol_index is not None
+            and backend in _EMBEDDED_BULK_BACKENDS
+            and pyarrow_available()
+        )
 
     def _get_all_node_labels(self) -> list[str]:
         """Discover all node labels in the database, backend-aware.
@@ -353,6 +535,353 @@ class GraphWriter:
                 )
 
         execute_write_operation(self.driver, backend, _work)
+    def _build_label_rows(
+        self,
+        label: str,
+        item_list: List[Dict[str, Any]],
+        occurrence_indices: List[int],
+        keyed_by_position: bool,
+        file_path_str: str,
+        is_dependency: bool,
+        _should_redact: bool,
+        secret_findings: List[Tuple[str, str, str, Optional[str]]],
+        params_batch: List[Dict[str, Any]],
+        class_fn_batch: List[Dict[str, Any]],
+        enum_member_batch: List[Dict[str, Any]],
+        nested_fn_batch: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Build the sanitised, type-normalised rows for one label of a file.
+
+        The side lists (params, class/function links, enum members, nested
+        functions, secret findings) are appended to in place.
+        """
+        batch: List[Dict[str, Any]] = []
+        for occurrence_index, item in zip(occurrence_indices, item_list):
+            row = dict(item)
+            row["path"] = file_path_str
+            if keyed_by_position:
+                row["occurrence_index"] = occurrence_index
+            # Inherit the file's is_dependency unless the extractor set its
+            # own. Only ~half the language extractors emit this per item, and
+            # find_dead_code filters on `func.is_dependency = false` -- in
+            # Cypher `null = false` is null, not false, so every function from
+            # an extractor that omitted it was silently dropped and the tool
+            # returned an empty list. Module has no such column in the schema.
+            if label != "Module":
+                row.setdefault("is_dependency", is_dependency)
+            if label == "Function" and "cyclomatic_complexity" not in row:
+                row["cyclomatic_complexity"] = 1
+            sanitized, findings = sanitize_props_with_secrets(row, redact=_should_redact)
+            batch.append(sanitized)
+            for prop_key, pattern in findings:
+                item_name = item.get("name", "<unknown>")
+                secret_findings.append((label, item_name, prop_key, pattern))
+            if label == "EnumMember":
+                enum_member_batch.append(
+                    {
+                        "class_name": item.get("enum_name"),
+                        "class_line": item.get("enum_line_number", -1),
+                        "member_name": item["name"],
+                    }
+                )
+            if label == "Function":
+                for arg_name in item.get("args", []):
+                    params_batch.append(
+                        {
+                            "func_name": item["name"],
+                            "line_number": item["line_number"],
+                            "occurrence_index": occurrence_index,
+                            "arg_name": arg_name,
+                        }
+                    )
+                if item.get("class_context"):
+                    class_fn_batch.append(
+                        {
+                            "class_name": item["class_context"],
+                            "class_line": item.get("class_context_line", -1)
+                            if item.get("class_context_line") is not None
+                            else -1,
+                            "func_name": item["name"],
+                            "func_line": item["line_number"],
+                        }
+                    )
+                if item.get("context_type") in _FUNCTION_CONTEXT_TYPES:
+                    outer_ctx = item.get("context")
+                    is_seq = isinstance(outer_ctx, (tuple, list)) and outer_ctx
+                    outer_name = outer_ctx[0] if is_seq else outer_ctx
+                    # The parser already reports the enclosing function's
+                    # line (_get_parent_context returns name, type, line)
+                    # but it was discarded, so the MATCH below keyed on
+                    # name alone. Any file with two same-named functions
+                    # — i.e. the same method name on two classes, which
+                    # is extremely common — got a false CONTAINS edge.
+                    if is_seq and len(outer_ctx) > 2 and isinstance(outer_ctx[2], int):
+                        outer_line = outer_ctx[2]
+                    else:
+                        # Parsers that flatten `context` to a bare name
+                        # report the line separately.
+                        raw_line = item.get("context_line", -1)
+                        outer_line = raw_line if isinstance(raw_line, int) else -1
+                    nested_fn_batch.append(
+                        {
+                            "outer": outer_name,
+                            "outer_line": outer_line,
+                            "inner_name": item["name"],
+                            "inner_line": item["line_number"],
+                        }
+                    )
+
+        if batch:
+            import json as _json
+
+            all_keys = set()
+            for b in batch:
+                all_keys.update(b.keys())
+
+            for k in all_keys:
+                counts: Dict[str, int] = {}
+                for b in batch:
+                    v = b.get(k)
+                    if v is not None:
+                        tname = type(v).__name__
+                        counts[tname] = counts.get(tname, 0) + 1
+
+                dominant = max(counts, key=counts.get) if counts else "str"
+
+                for b in batch:
+                    v = b.get(k)
+                    if dominant == "list":
+                        # An empty list persists as [], not [""] (#1607).
+                        # The sentinel was not guarding a backend that
+                        # rejects empty lists: Kùzu accepts [] for a
+                        # STRING[] column in every shape used here --
+                        # inside UNWIND $rows, as a single-row parameter,
+                        # and when every row in the batch is empty, so
+                        # there is no sibling row to infer an element
+                        # type from. `dominant` above is unaffected too:
+                        # it only skips None, and [] is not None, so an
+                        # always-empty key still resolves to "list".
+                        if isinstance(v, list):
+                            b[k] = [str(x) for x in v]
+                        elif isinstance(v, str) and v:
+                            try:
+                                p = _json.loads(v)
+                                b[k] = [str(x) for x in p] if isinstance(p, list) and p else []
+                            except Exception:
+                                b[k] = [v]
+                        else:
+                            b[k] = []
+                    elif dominant == "int":
+                        if v is None or v == "":
+                            b[k] = 0
+                        elif not isinstance(v, int):
+                            try:
+                                b[k] = int(v)
+                            except Exception:
+                                b[k] = 0
+                    elif dominant == "bool":
+                        b[k] = bool(v) if v is not None else False
+                    else:
+                        if v is None:
+                            b.pop(k, None)
+                        elif isinstance(v, list):
+                            b[k] = _json.dumps(v)
+                        elif not isinstance(v, str):
+                            b[k] = str(v)
+
+            key_order = sorted(all_keys)
+            batch[:] = [{k: b[k] for k in key_order if k in b} for b in batch]
+
+        return batch
+
+
+    def _emit_side_rows(
+        self,
+        session: Any,
+        file_data: Dict[str, Any],
+        lang: Optional[str],
+        file_path_str: str,
+        backend: str,
+        params_batch: List[Dict[str, Any]],
+        class_fn_batch: List[Dict[str, Any]],
+        enum_member_batch: List[Dict[str, Any]],
+        nested_fn_batch: List[Dict[str, Any]],
+    ) -> None:
+        """Write the parameter, enum-member, class/function, nested-function,
+        import and module-inclusion rows for one file, in the same order as before."""
+        if params_batch:
+            seen_params: set = set()
+            unique_params: List[Dict[str, Any]] = []
+            for p in params_batch:
+                # occurrence_index belongs in the dedupe key too: without it
+                # two colliding functions that share an argument name would
+                # collapse to one row and only one of them would be linked.
+                key = (p["func_name"], p["line_number"], p["occurrence_index"], p["arg_name"])
+                if key not in seen_params:
+                    seen_params.add(key)
+                    unique_params.append(p)
+            fn_match = "MATCH (fn:Function {name: row.func_name, path: $file_path, line_number: row.line_number, occurrence_index: row.occurrence_index})"
+            _run_node_then_rel(
+                session,
+                """
+                UNWIND $batch AS row
+                MERGE (p:Parameter {name: row.arg_name, path: $file_path, function_line_number: row.line_number})
+                SET p.name = row.arg_name, p.path = $file_path, p.function_line_number = row.line_number
+            """,
+                # one row per Parameter key whose Function exists, as the combined query's MATCH required
+                lambda s: s.run(f"UNWIND $batch AS row {fn_match} RETURN DISTINCT row.arg_name AS arg_name, "
+                                "row.line_number AS line_number", batch=unique_params, file_path=file_path_str).data(),
+                f"""
+                UNWIND $batch AS row
+                {fn_match}
+                MATCH (p:Parameter {{name: row.arg_name, path: $file_path, function_line_number: row.line_number}})
+                MERGE (fn)-[:HAS_PARAMETER]->(p)
+            """,
+                unique_params,
+                """
+                UNWIND $batch AS row
+                MATCH (fn:Function {name: row.func_name, path: $file_path, line_number: row.line_number, occurrence_index: row.occurrence_index})
+                MERGE (p:Parameter {name: row.arg_name, path: $file_path, function_line_number: row.line_number})
+                SET p.name = row.arg_name, p.path = $file_path, p.function_line_number = row.line_number
+                MERGE (fn)-[:HAS_PARAMETER]->(p)
+            """,
+                unique_params,
+                split=backend != "ladybugdb",
+                file_path=file_path_str,
+            )
+
+        if enum_member_batch:
+            for label in ("Class", "Enum"):
+                try:
+                    session.run(
+                        f"""
+                        UNWIND $batch AS row
+                        MATCH (c:{label} {{name: row.class_name, path: $file_path}})
+                        MATCH (m:EnumMember {{name: row.member_name, path: $file_path}})
+                        WHERE row.class_line < 0 OR c.line_number = row.class_line
+                        MERGE (c)-[:CONTAINS]->(m)
+                        """,
+                        batch=enum_member_batch,
+                        file_path=file_path_str,
+                    )
+                except Exception as e:
+                    if _is_binder_exception(e):
+                        continue
+                    raise e
+
+        if class_fn_batch:
+            for label in ("Class", "Module", "Interface", "Struct", "Record", "Trait", "Object", "Mixin"):
+                try:
+                    session.run(
+                        f"""
+                        UNWIND $batch AS row
+                        MATCH (c:{label} {{name: row.class_name, path: $file_path}})
+                        MATCH (fn:Function {{name: row.func_name, path: $file_path, line_number: row.func_line}})
+                        WHERE row.class_line < 0 OR c.line_number = row.class_line
+                        MERGE (c)-[:CONTAINS]->(fn)
+                        """,
+                        batch=class_fn_batch,
+                        file_path=file_path_str,
+                    )
+                except Exception as e:
+                    if _is_binder_exception(e):
+                        continue
+                    raise e
+
+
+        if nested_fn_batch:
+            session.run(
+                """
+                UNWIND $batch AS row
+                MATCH (outer:Function {name: row.outer, path: $file_path})
+                WHERE row.outer_line < 0 OR outer.line_number = row.outer_line
+                MATCH (inner:Function {name: row.inner_name, path: $file_path, line_number: row.inner_line})
+                MERGE (outer)-[:CONTAINS]->(inner)
+            """,
+                batch=nested_fn_batch,
+                file_path=file_path_str,
+            )
+
+        js_imports, other_imports = _import_rows(file_data, lang)
+
+        if js_imports:
+            session.run(
+                """
+                UNWIND $batch AS row
+                MATCH (f:File {path: $file_path})
+                MERGE (m:Module {name: row.module_name})
+                MERGE (f)-[r:IMPORTS {line_number: row.line_number}]->(m)
+                SET r.imported_name = row.imported_name,
+                    r.alias = row.alias,
+                    r.lang = row.lang
+            """,
+                batch=js_imports,
+                file_path=file_path_str,
+            )
+
+        if other_imports:
+            other_imports = sort_import_rows_for_metadata(other_imports)
+            _run_node_then_rel(
+                session,
+                """
+                UNWIND $batch AS row
+                MATCH (f:File {path: $file_path})
+                MERGE (m:Module {name: row.name})
+                SET m.lang = coalesce(m.lang, row.lang),
+                    m.full_import_name = coalesce(m.full_import_name, row.full_import_name)
+            """,
+                _module_node_rows(other_imports),
+                """
+                UNWIND $batch AS row
+                MATCH (f:File {path: $file_path})
+                MATCH (m:Module {name: row.name})
+                MERGE (f)-[r:IMPORTS {line_number: row.line_number, imported_name: row.imported_name}]->(m)
+                SET r.alias = coalesce(row.alias, ""),
+                    r.full_import_name = row.full_import_name,
+                    r.lang = row.lang
+            """,
+                _last_row_per_key(other_imports, lambda r: (r["name"], r["line_number"], r["imported_name"])),
+                """
+                UNWIND $batch AS row
+                MATCH (f:File {path: $file_path})
+                MERGE (m:Module {name: row.name})
+                SET m.lang = coalesce(m.lang, row.lang),
+                    m.full_import_name = coalesce(m.full_import_name, row.full_import_name)
+                MERGE (f)-[r:IMPORTS {line_number: row.line_number, imported_name: row.imported_name}]->(m)
+                SET r.alias = coalesce(row.alias, ""),
+                    r.full_import_name = row.full_import_name,
+                    r.lang = row.lang
+            """,
+                other_imports,
+                split=backend != "ladybugdb",
+                file_path=file_path_str,
+            )
+
+        module_inclusions = file_data.get("module_inclusions", [])
+        if module_inclusions:
+            session.run(
+                """
+                UNWIND $batch AS row
+                MATCH (c:Class {name: row.class_name, path: $file_path})
+                MERGE (m:Module {name: row.module_name})
+                MERGE (c)-[:INCLUDES]->(m)
+            """,
+                batch=[
+                    {"class_name": i["class"], "module_name": i["module"]} for i in module_inclusions
+                ],
+                file_path=file_path_str,
+            )
+
+
+
+    def _stage_inclusions(self, file_path: str, rows: List[Dict[str, Any]]) -> None:
+        """Collect one file's INCLUDES edges and their Module nodes (repo init on KùzuDB).
+
+        Runs when the file's writes are applied, so the Class entries it matches exist.
+        """
+        edges, modules = build_inclusion_edges(self._symbol_index, rows, file_path)
+        self._bulk.add_inclusions(edges, modules)
+
     def add_file_to_graph(
         self,
         file_data: Dict[str, Any],
@@ -371,6 +900,11 @@ class GraphWriter:
         from ....cli.config_manager import get_config_value as _gcv
         _should_redact = (_gcv("REDACT_SECRETS") or "false").lower() == "true"
         def _work(session):
+            # Symbol-index registrations and bulk-collector rows are staged here and
+            # applied only after every write for this file succeeded. A failure part way
+            # through leaves nothing behind, so a retry of this file cannot add its rows
+            # or index entries a second time.
+            staged: List[Callable[[], None]] = []
             if repo_path_str:
                 resolved_repo_str = _normalize_path(repo_path_str)
             else:
@@ -405,6 +939,8 @@ class GraphWriter:
                 # Nothing set it before, so every bundle advertised no languages.
                 language=lang,
             )
+            if self._symbol_index is not None:
+                staged.append(partial(self._symbol_index.register, "File", file_name, file_path_str, key=file_path_str))
 
             file_path_obj = Path(file_path_str)
             repo_path_obj = Path(resolved_repo_str)
@@ -423,33 +959,40 @@ class GraphWriter:
                     "directory hierarchy."
                 )
                 relative_path_to_file = Path(file_path_obj.name)
-            parent_path = resolved_repo_str
-            parent_label = "Repository"
-            for part in relative_path_to_file.parts[:-1]:
-                # Normalize directory paths too
-                current_path_str = _normalize_path(Path(parent_path) / part)
+            if self._bulk is not None and self._use_index_writes(backend):
+                # Repo init on KùzuDB: the directory chain is loaded by flush_bulk.
+                dir_nodes, dir_links = _directory_chain(
+                    resolved_repo_str, relative_path_to_file.parts[:-1], file_path_str
+                )
+                staged.append(partial(self._bulk.add_directory_links, dir_nodes, dir_links))
+            else:
+                parent_path = resolved_repo_str
+                parent_label = "Repository"
+                for part in relative_path_to_file.parts[:-1]:
+                    # Normalize directory paths too
+                    current_path_str = _normalize_path(Path(parent_path) / part)
+                    session.run(
+                        f"""
+                        MATCH (p:`{parent_label}` {{path: $parent_path}})
+                        MERGE (d:Directory {{path: $current_path}})
+                        SET d.name = $part
+                        MERGE (p)-[:CONTAINS]->(d)
+                    """,
+                        parent_path=parent_path,
+                        current_path=current_path_str,
+                        part=part,
+                    )
+                    parent_path = current_path_str
+                    parent_label = "Directory"
                 session.run(
                     f"""
                     MATCH (p:`{parent_label}` {{path: $parent_path}})
-                    MERGE (d:Directory {{path: $current_path}})
-                    SET d.name = $part
-                    MERGE (p)-[:CONTAINS]->(d)
+                    MATCH (f:File {{path: $path}})
+                    MERGE (p)-[:CONTAINS]->(f)
                 """,
                     parent_path=parent_path,
-                    current_path=current_path_str,
-                    part=part,
+                    path=file_path_str,
                 )
-                parent_path = current_path_str
-                parent_label = "Directory"
-            session.run(
-                f"""
-                MATCH (p:`{parent_label}` {{path: $parent_path}})
-                MATCH (f:File {{path: $path}})
-                MERGE (p)-[:CONTAINS]->(f)
-            """,
-                parent_path=parent_path,
-                path=file_path_str,
-            )
 
             item_mappings = [
                 (file_data.get("functions", []), "Function"),
@@ -500,142 +1043,38 @@ class GraphWriter:
                         f"occurrence_index: {shown}"
                     )
 
-                batch: List[Dict[str, Any]] = []
-                for occurrence_index, item in zip(occurrence_indices, item_list):
-                    row = dict(item)
-                    row["path"] = file_path_str
-                    if keyed_by_position:
-                        row["occurrence_index"] = occurrence_index
-                    # Inherit the file's is_dependency unless the extractor set its
-                    # own. Only ~half the language extractors emit this per item, and
-                    # find_dead_code filters on `func.is_dependency = false` -- in
-                    # Cypher `null = false` is null, not false, so every function from
-                    # an extractor that omitted it was silently dropped and the tool
-                    # returned an empty list. Module has no such column in the schema.
-                    if label != "Module":
-                        row.setdefault("is_dependency", is_dependency)
-                    if label == "Function" and "cyclomatic_complexity" not in row:
-                        row["cyclomatic_complexity"] = 1
-                    sanitized, findings = sanitize_props_with_secrets(row, redact=_should_redact)
-                    batch.append(sanitized)
-                    for prop_key, pattern in findings:
-                        item_name = item.get("name", "<unknown>")
-                        secret_findings.append((label, item_name, prop_key, pattern))
-                    if label == "EnumMember":
-                        enum_member_batch.append(
-                            {
-                                "class_name": item.get("enum_name"),
-                                "class_line": item.get("enum_line_number", -1),
-                                "member_name": item["name"],
-                            }
-                        )
-                    if label == "Function":
-                        for arg_name in item.get("args", []):
-                            params_batch.append(
-                                {
-                                    "func_name": item["name"],
-                                    "line_number": item["line_number"],
-                                    "occurrence_index": occurrence_index,
-                                    "arg_name": arg_name,
-                                }
-                            )
-                        if item.get("class_context"):
-                            class_fn_batch.append(
-                                {
-                                    "class_name": item["class_context"],
-                                    "class_line": item.get("class_context_line", -1)
-                                    if item.get("class_context_line") is not None
-                                    else -1,
-                                    "func_name": item["name"],
-                                    "func_line": item["line_number"],
-                                }
-                            )
-                        if item.get("context_type") in _FUNCTION_CONTEXT_TYPES:
-                            outer_ctx = item.get("context")
-                            is_seq = isinstance(outer_ctx, (tuple, list)) and outer_ctx
-                            outer_name = outer_ctx[0] if is_seq else outer_ctx
-                            # The parser already reports the enclosing function's
-                            # line (_get_parent_context returns name, type, line)
-                            # but it was discarded, so the MATCH below keyed on
-                            # name alone. Any file with two same-named functions
-                            # — i.e. the same method name on two classes, which
-                            # is extremely common — got a false CONTAINS edge.
-                            if is_seq and len(outer_ctx) > 2 and isinstance(outer_ctx[2], int):
-                                outer_line = outer_ctx[2]
-                            else:
-                                # Parsers that flatten `context` to a bare name
-                                # report the line separately.
-                                raw_line = item.get("context_line", -1)
-                                outer_line = raw_line if isinstance(raw_line, int) else -1
-                            nested_fn_batch.append(
-                                {
-                                    "outer": outer_name,
-                                    "outer_line": outer_line,
-                                    "inner_name": item["name"],
-                                    "inner_line": item["line_number"],
-                                }
-                            )
+                batch = self._build_label_rows(
+                    label,
+                    item_list,
+                    occurrence_indices,
+                    keyed_by_position,
+                    file_path_str,
+                    is_dependency,
+                    _should_redact,
+                    secret_findings,
+                    params_batch,
+                    class_fn_batch,
+                    enum_member_batch,
+                    nested_fn_batch,
+                )
 
-                if batch:
-                    import json as _json
-
-                    all_keys = set()
+                if batch and self._symbol_index is not None:
                     for b in batch:
-                        all_keys.update(b.keys())
+                        staged.append(partial(
+                            self._symbol_index.register,
+                            label,
+                            b["name"],
+                            file_path_str,
+                            b.get("line_number"),
+                            context=(b.get("context") or "") if label == "Function" else "",
+                            key=kuzu_uid(label, b) or b.get("name"),
+                            class_context=(b.get("class_context") or "") if label == "Function" else "",
+                            module_context=(b.get("module_context") or "") if label == "Function" else "",
+                        ))
 
-                    for k in all_keys:
-                        counts: Dict[str, int] = {}
-                        for b in batch:
-                            v = b.get(k)
-                            if v is not None:
-                                tname = type(v).__name__
-                                counts[tname] = counts.get(tname, 0) + 1
-
-                        dominant = max(counts, key=counts.get) if counts else "str"
-
-                        for b in batch:
-                            v = b.get(k)
-                            if dominant == "list":
-                                # An empty list persists as [], not [""] (#1607).
-                                # The sentinel was not guarding a backend that
-                                # rejects empty lists: Kùzu accepts [] for a
-                                # STRING[] column in every shape used here --
-                                # inside UNWIND $rows, as a single-row parameter,
-                                # and when every row in the batch is empty, so
-                                # there is no sibling row to infer an element
-                                # type from. `dominant` above is unaffected too:
-                                # it only skips None, and [] is not None, so an
-                                # always-empty key still resolves to "list".
-                                if isinstance(v, list):
-                                    b[k] = [str(x) for x in v]
-                                elif isinstance(v, str) and v:
-                                    try:
-                                        p = _json.loads(v)
-                                        b[k] = [str(x) for x in p] if isinstance(p, list) and p else []
-                                    except Exception:
-                                        b[k] = [v]
-                                else:
-                                    b[k] = []
-                            elif dominant == "int":
-                                if v is None or v == "":
-                                    b[k] = 0
-                                elif not isinstance(v, int):
-                                    try:
-                                        b[k] = int(v)
-                                    except Exception:
-                                        b[k] = 0
-                            elif dominant == "bool":
-                                b[k] = bool(v) if v is not None else False
-                            else:
-                                if v is None:
-                                    b.pop(k, None)
-                                elif isinstance(v, list):
-                                    b[k] = _json.dumps(v)
-                                elif not isinstance(v, str):
-                                    b[k] = str(v)
-
-                    key_order = sorted(all_keys)
-                    batch[:] = [{k: b[k] for k in key_order if k in b} for b in batch]
+                if self._bulk is not None:
+                    staged.append(partial(self._bulk.add_nodes, label, batch, file_path_str))
+                    continue
 
                 if not keyed_by_position:
                     merge_clause = f"MERGE (n:{label} {{name: row.name}})"
@@ -672,215 +1111,55 @@ class GraphWriter:
                     file_path=file_path_str,
                 )
 
-            if params_batch:
-                seen_params: set = set()
-                unique_params: List[Dict[str, Any]] = []
-                for p in params_batch:
-                    # occurrence_index belongs in the dedupe key too: without it
-                    # two colliding functions that share an argument name would
-                    # collapse to one row and only one of them would be linked.
-                    key = (p["func_name"], p["line_number"], p["occurrence_index"], p["arg_name"])
-                    if key not in seen_params:
-                        seen_params.add(key)
-                        unique_params.append(p)
-                fn_match = "MATCH (fn:Function {name: row.func_name, path: $file_path, line_number: row.line_number, occurrence_index: row.occurrence_index})"
-                _run_node_then_rel(
-                    session,
-                    """
-                    UNWIND $batch AS row
-                    MERGE (p:Parameter {name: row.arg_name, path: $file_path, function_line_number: row.line_number})
-                    SET p.name = row.arg_name, p.path = $file_path, p.function_line_number = row.line_number
-                """,
-                    # one row per Parameter key whose Function exists, as the combined query's MATCH required
-                    lambda s: s.run(f"UNWIND $batch AS row {fn_match} RETURN DISTINCT row.arg_name AS arg_name, "
-                                    "row.line_number AS line_number", batch=unique_params, file_path=file_path_str).data(),
-                    f"""
-                    UNWIND $batch AS row
-                    {fn_match}
-                    MATCH (p:Parameter {{name: row.arg_name, path: $file_path, function_line_number: row.line_number}})
-                    MERGE (fn)-[:HAS_PARAMETER]->(p)
-                """,
-                    unique_params,
-                    """
-                    UNWIND $batch AS row
-                    MATCH (fn:Function {name: row.func_name, path: $file_path, line_number: row.line_number, occurrence_index: row.occurrence_index})
-                    MERGE (p:Parameter {name: row.arg_name, path: $file_path, function_line_number: row.line_number})
-                    SET p.name = row.arg_name, p.path = $file_path, p.function_line_number = row.line_number
-                    MERGE (fn)-[:HAS_PARAMETER]->(p)
-                """,
-                    unique_params,
-                    split=backend != "ladybugdb",
-                    file_path=file_path_str,
-                )
-
-            if enum_member_batch:
-                for label in ("Class", "Enum"):
-                    try:
-                        session.run(
-                            f"""
-                            UNWIND $batch AS row
-                            MATCH (c:{label} {{name: row.class_name, path: $file_path}})
-                            MATCH (m:EnumMember {{name: row.member_name, path: $file_path}})
-                            WHERE row.class_line < 0 OR c.line_number = row.class_line
-                            MERGE (c)-[:CONTAINS]->(m)
-                            """,
-                            batch=enum_member_batch,
-                            file_path=file_path_str,
-                        )
-                    except Exception as e:
-                        if _is_binder_exception(e):
-                            continue
-                        raise e
-
-            if class_fn_batch:
-                for label in ("Class", "Module", "Interface", "Struct", "Record", "Trait", "Object", "Mixin"):
-                    try:
-                        session.run(
-                            f"""
-                            UNWIND $batch AS row
-                            MATCH (c:{label} {{name: row.class_name, path: $file_path}})
-                            MATCH (fn:Function {{name: row.func_name, path: $file_path, line_number: row.func_line}})
-                            WHERE row.class_line < 0 OR c.line_number = row.class_line
-                            MERGE (c)-[:CONTAINS]->(fn)
-                            """,
-                            batch=class_fn_batch,
-                            file_path=file_path_str,
-                        )
-                    except Exception as e:
-                        if _is_binder_exception(e):
-                            continue
-                        raise e
-
-
-            if nested_fn_batch:
-                session.run(
-                    """
-                    UNWIND $batch AS row
-                    MATCH (outer:Function {name: row.outer, path: $file_path})
-                    WHERE row.outer_line < 0 OR outer.line_number = row.outer_line
-                    MATCH (inner:Function {name: row.inner_name, path: $file_path, line_number: row.inner_line})
-                    MERGE (outer)-[:CONTAINS]->(inner)
-                """,
-                    batch=nested_fn_batch,
-                    file_path=file_path_str,
-                )
-
-            js_imports = []
-
-            other_imports = []
-            for imp in file_data.get("imports", []):
-                if lang in {"javascript", "typescript", "tsx"}:
-                    module_name = imp.get("source")
-                    if module_name:
-                        js_imports.append(
-                            {
-                                "module_name": module_name,
-                                "imported_name": imp.get("name", "*"),
-                                "alias": imp.get("alias") or "",
-                                "line_number": imp.get("line_number") or 0,
-                                "lang": imp.get("lang") or lang,
-                            }
-                        )
+            side_args = (
+                file_data,
+                lang,
+                file_path_str,
+                backend,
+                params_batch,
+                class_fn_batch,
+                enum_member_batch,
+                nested_fn_batch,
+            )
+            if self._symbol_index is not None and class_fn_batch:
+                # Repo init: record Class-CONTAINS->Function edges. Staged after the node
+                # registrations above, so the Class and Function entries exist when it runs.
+                staged.append(partial(add_contains_edges, self._symbol_index, list(class_fn_batch), file_path_str))
+            if self._bulk is not None:
+                # Parameters and HAS_PARAMETER are collected and COPYed with the nodes;
+                # the rest of the side rows match nodes that exist only after the load.
+                staged.append(partial(self._bulk.add_parameters, file_path_str, params_batch))
+                # Import rows apply now, in file order with the node rows; the deferred
+                # side rows get a copy of the file with no imports left to write.
+                js_rows, other_rows = _import_rows(file_data, lang)
+                staged.append(partial(
+                    self._bulk.add_imports,
+                    file_path_str,
+                    js_rows,
+                    sort_import_rows_for_metadata(other_rows),
+                ))
+                if self._use_index_writes(backend):
+                    # INCLUDES is staged here, against the Class entries registered above,
+                    # so the deferred side rows get no module_inclusions to write.
+                    staged.append(partial(
+                        self._stage_inclusions,
+                        file_path_str,
+                        file_data.get("module_inclusions", []),
+                    ))
+                    deferred_file_data = {**file_data, "imports": [], "module_inclusions": []}
                 else:
-                    # Python from-imports keep `name` as the imported symbol
-                    # (call resolution) and stash the module in `source`.
-                    if lang == "python" and imp.get("source"):
-                        module_name = imp.get("source")
-                    else:
-                        module_name = (
-                            imp.get("name")
-                            or imp.get("source")
-                            or imp.get("full_import_name")
-                        )
-                    if not module_name:
-                        continue
-                    full_import_name = (
-                        imp.get("full_import_name")
-                        or imp.get("source")
-                        or module_name
-                    )
-                    other_imports.append(
-                        {
-                            "name": module_name,
-                            "full_import_name": full_import_name,
-                            "imported_name": (
-                                imp.get("imported_name")
-                                or imp.get("name")
-                                or module_name
-                            ),
-                            "alias": imp.get("alias"),
-                            "line_number": imp.get("line_number") or 0,
-                            "lang": imp.get("lang") or lang,
-                        }
-                    )
+                    deferred_file_data = {**file_data, "imports": []}
+                deferred_args = (deferred_file_data, *side_args[1:4], [], *side_args[5:])
+                staged.append(partial(
+                    self._bulk.defer,
+                    lambda s: self._emit_side_rows(s, *deferred_args),
+                ))
+            else:
+                self._emit_side_rows(session, *side_args)
 
-            if js_imports:
-                session.run(
-                    """
-                    UNWIND $batch AS row
-                    MATCH (f:File {path: $file_path})
-                    MERGE (m:Module {name: row.module_name})
-                    MERGE (f)-[r:IMPORTS {line_number: row.line_number}]->(m)
-                    SET r.imported_name = row.imported_name,
-                        r.alias = row.alias,
-                        r.lang = row.lang
-                """,
-                    batch=js_imports,
-                    file_path=file_path_str,
-                )
-
-            if other_imports:
-                other_imports = sort_import_rows_for_metadata(other_imports)
-                _run_node_then_rel(
-                    session,
-                    """
-                    UNWIND $batch AS row
-                    MATCH (f:File {path: $file_path})
-                    MERGE (m:Module {name: row.name})
-                    SET m.lang = coalesce(m.lang, row.lang),
-                        m.full_import_name = coalesce(m.full_import_name, row.full_import_name)
-                """,
-                    _module_node_rows(other_imports),
-                    """
-                    UNWIND $batch AS row
-                    MATCH (f:File {path: $file_path})
-                    MATCH (m:Module {name: row.name})
-                    MERGE (f)-[r:IMPORTS {line_number: row.line_number, imported_name: row.imported_name}]->(m)
-                    SET r.alias = coalesce(row.alias, ""),
-                        r.full_import_name = row.full_import_name,
-                        r.lang = row.lang
-                """,
-                    _last_row_per_key(other_imports, lambda r: (r["name"], r["line_number"], r["imported_name"])),
-                    """
-                    UNWIND $batch AS row
-                    MATCH (f:File {path: $file_path})
-                    MERGE (m:Module {name: row.name})
-                    SET m.lang = coalesce(m.lang, row.lang),
-                        m.full_import_name = coalesce(m.full_import_name, row.full_import_name)
-                    MERGE (f)-[r:IMPORTS {line_number: row.line_number, imported_name: row.imported_name}]->(m)
-                    SET r.alias = coalesce(row.alias, ""),
-                        r.full_import_name = row.full_import_name,
-                        r.lang = row.lang
-                """,
-                    other_imports,
-                    split=backend != "ladybugdb",
-                    file_path=file_path_str,
-                )
-
-            module_inclusions = file_data.get("module_inclusions", [])
-            if module_inclusions:
-                session.run(
-                    """
-                    UNWIND $batch AS row
-                    MATCH (c:Class {name: row.class_name, path: $file_path})
-                    MERGE (m:Module {name: row.module_name})
-                    MERGE (c)-[:INCLUDES]->(m)
-                """,
-                    batch=[
-                        {"class_name": i["class"], "module_name": i["module"]} for i in module_inclusions
-                    ],
-                    file_path=file_path_str,
-                )
+            # Every write for this file has succeeded; now make its rows and index entries visible.
+            for apply_staged in staged:
+                apply_staged()
 
         execute_write_operation(self.driver, backend, _work)
 
@@ -940,6 +1219,13 @@ class GraphWriter:
                 relative_path_to_file = file_path_obj.relative_to(repo_path_obj)
             except ValueError:
                 relative_path_to_file = Path(file_path_obj.name)
+
+            if self._bulk is not None and self._use_index_writes(backend):
+                dir_nodes, dir_links = _directory_chain(
+                    repo_path_str, relative_path_to_file.parts[:-1], file_path_str
+                )
+                self._bulk.add_directory_links(dir_nodes, dir_links)
+                return
 
             parent_path = repo_path_str
             parent_label = "Repository"
@@ -1170,6 +1456,28 @@ class GraphWriter:
                         f"[{relation_label}] {caller_label}-to-{called_label}: {len(batch_rows)} edges written in {time.time()-t0:.1f}s"
                     )
 
+                if self._symbol_index is not None:
+                    # Repo init: record the edges phase 5 reads, whichever branch writes them.
+                    add_call_edges(
+                        self._symbol_index,
+                        precise_batch + heuristic_batch,
+                        caller_label,
+                        called_label,
+                    )
+
+                if self._use_index_writes(backend) and (caller_label, called_label) in _INDEXED_CALL_GROUPS:
+                    # Repo init: endpoints come from the index and the edges are COPYed.
+                    for rel_rows, rel_label in ((precise_batch, "CALLS"), (heuristic_batch, "HEURISTIC_CALLS")):
+                        copy_rel_rows(
+                            session,
+                            rel_label,
+                            caller_label,
+                            called_label,
+                            build_call_edges(self._symbol_index, rel_rows, caller_label, called_label),
+                            CALL_REL_PROPERTIES,
+                        )
+                    continue
+
                 _write_batch(precise_batch, "CALLS")
                 _write_batch(heuristic_batch, "HEURISTIC_CALLS")
 
@@ -1286,6 +1594,8 @@ class GraphWriter:
                 # If the existence probe itself fails for any reason, fall back to
                 # treating the label as populated -- we must never *skip* a pair
                 # that could have produced a real edge.
+                if self._symbol_index is not None:
+                    return self._symbol_index.has_label(label)
                 cypher_label = _cypher_label(label, backend)
                 try:
                     result = session.run(f"MATCH (n:{cypher_label}) RETURN n LIMIT 1")
@@ -1301,11 +1611,26 @@ class GraphWriter:
             # probe silently drop real INHERITS edges.
             populated_labels = {label for label in labels if _label_is_populated(label)}
 
+            inherits_bindings = declared_bindings(session, "INHERITS") if self._use_index_writes(backend) else set()
+
             def _chunks(rows):
                 for i in range(0, len(rows), batch_size):
                     yield rows[i:i + batch_size]
 
             def _run_internal(rows, child_label, parent_label):
+                if self._use_index_writes(backend):
+                    # Same outcome as the MATCH/MERGE below: a pair the schema does not
+                    # bind writes nothing, and matches come from the index.
+                    if (child_label, parent_label) in inherits_bindings:
+                        copy_rel_rows(
+                            session,
+                            "INHERITS",
+                            child_label,
+                            parent_label,
+                            build_inherit_edges(self._symbol_index, rows, child_label, parent_label),
+                            {"confidence_label": "STRING"},
+                        )
+                    return
                 child_cypher = _cypher_label(child_label, backend)
                 parent_cypher = _cypher_label(parent_label, backend)
                 query = f"""
@@ -1407,18 +1732,50 @@ class GraphWriter:
                     ext_by_child.setdefault(cl, []).append(row)
                 else:
                     ext_legacy.append(row)
-            for cl, rows in ext_by_child.items():
-                _run_external(rows, cl)
-            if ext_legacy:
-                for cl in labels:
-                    if cl not in populated_labels:
-                        continue
-                    _run_external(ext_legacy, cl)
+            if self._use_index_writes(backend):
+                # Same outcome as _run_external: parents are created for every row whose
+                # child exists, and the edge is written only for a binding the schema has.
+                ext_groups: Dict[str, List[Dict[str, Any]]] = {
+                    cl: list(rows) for cl, rows in ext_by_child.items()
+                }
+                if ext_legacy:
+                    for cl in labels:
+                        if cl in populated_labels:
+                            ext_groups.setdefault(cl, []).extend(ext_legacy)
+                ext_edges: Dict[str, List[Dict[str, Any]]] = {}
+                parent_names: set = set()
+                for cl, rows in ext_groups.items():
+                    edges, names = build_external_inherit_edges(self._symbol_index, rows, cl)
+                    ext_edges[cl] = edges
+                    parent_names |= names
+                load_external_classes(session, parent_names)
+                for cl, edges in ext_edges.items():
+                    if (cl, "ExternalClass") in inherits_bindings:
+                        copy_rel_rows(
+                            session,
+                            "INHERITS",
+                            cl,
+                            "ExternalClass",
+                            edges,
+                            {"confidence_label": "STRING"},
+                        )
+            else:
+                for cl, rows in ext_by_child.items():
+                    _run_external(rows, cl)
+                if ext_legacy:
+                    for cl in labels:
+                        if cl not in populated_labels:
+                            continue
+                        _run_external(ext_legacy, cl)
 
             for file_data in csharp_files:
                 self._create_csharp_inheritance_and_interfaces(session, file_data, imports_map)
 
         execute_write_operation(self.driver, backend, _work)
+        if self._symbol_index is not None:
+            add_inherit_edges(self._symbol_index, inheritance_batch)
+            for file_data in csharp_files:
+                add_csharp_inherit_edges(self._symbol_index, file_data, _normalize_path(file_data["path"]))
         info_logger(f"[INHERITS] Complete: {len(inheritance_batch)} inheritance links processed.")
 
     def write_implements_links(self, implements_batch: List[Dict[str, Any]]) -> None:
@@ -1426,6 +1783,19 @@ class GraphWriter:
             return
 
         backend = get_backend_type(self.driver, self._db_manager)
+        if self._use_index_writes(backend):
+            def _copy_implements(session):
+                copy_grouped_edges(
+                    session,
+                    "IMPLEMENTS",
+                    build_implements_edges(self._symbol_index, implements_batch),
+                    {"confidence_label": "STRING"},
+                    declared_bindings(session, "IMPLEMENTS"),
+                )
+
+            execute_write_operation(self.driver, backend, _copy_implements)
+            info_logger(f"[IMPLEMENTS] Complete: {len(implements_batch)} implementation links processed.")
+            return
 
         def _work(session):
             for row in implements_batch:
@@ -1458,6 +1828,19 @@ class GraphWriter:
             return
 
         backend = get_backend_type(self.driver, self._db_manager)
+        if self._use_index_writes(backend):
+            def _copy_partial_of(session):
+                copy_grouped_edges(
+                    session,
+                    "PARTIAL_OF",
+                    build_partial_of_edges(self._symbol_index, partial_of_batch),
+                    {"line_number": "INT64", "confidence_label": "STRING"},
+                    declared_bindings(session, "PARTIAL_OF"),
+                )
+
+            execute_write_operation(self.driver, backend, _copy_partial_of)
+            info_logger(f"[PARTIAL_OF] Complete: {len(partial_of_batch)} partial class links processed.")
+            return
 
         def _work(session):
             for row in partial_of_batch:
@@ -1490,6 +1873,19 @@ class GraphWriter:
             return
 
         backend = get_backend_type(self.driver, self._db_manager)
+        if self._use_index_writes(backend):
+            def _copy_part_of(session):
+                copy_grouped_edges(
+                    session,
+                    "PART_OF",
+                    build_part_of_edges(self._symbol_index, part_of_batch),
+                    {},
+                    declared_bindings(session, "PART_OF"),
+                )
+
+            execute_write_operation(self.driver, backend, _copy_part_of)
+            info_logger(f"[PART_OF] Complete: {len(part_of_batch)} library part links processed.")
+            return
 
         def _work(session):
             for row in part_of_batch:
@@ -1510,6 +1906,31 @@ class GraphWriter:
 
         execute_write_operation(self.driver, backend, _work)
         info_logger(f"[PART_OF] Complete: {len(part_of_batch)} library part links processed.")
+
+    def _decorated_by_candidate_exists(self, row: Dict[str, Any], decorated_label: str) -> bool:
+        """Index-backed check of the two endpoints the DECORATED_BY MATCH needs.
+
+        Only called when a SymbolIndex is set. ``decorated_line`` must be present
+        because the database query compares ``line_number`` exactly.
+        """
+        index = self._symbol_index
+        decorated_line = row.get("decorated_line")
+        if decorated_line is None:
+            return False
+        context = None
+        if decorated_label == "Function":
+            context = row.get("decorated_context", "")
+            if context is None:
+                # `$ctx = ""` is NULL in Cypher when the parameter is NULL, so the
+                # database WHERE clause never matches.
+                return False
+        return index.has_node(
+            decorated_label,
+            row["decorated_name"],
+            row["decorated_path"],
+            decorated_line,
+            context=context,
+        ) and index.has_node("Function", row["decorator_name"], row["decorator_path"])
 
     def write_decorated_by_links(self, decorated_by_batch: List[Dict[str, Any]]) -> None:
         """Create DECORATED_BY edges from a decorated declaration to its decorator.
@@ -1542,11 +1963,28 @@ class GraphWriter:
             return
 
         backend = get_backend_type(self.driver, self._db_manager)
+        if self._use_index_writes(backend):
+            def _copy_decorated(session):
+                copy_grouped_edges(
+                    session,
+                    "DECORATED_BY",
+                    build_decorated_edges(self._symbol_index, decorated_by_batch),
+                    {"line_number": "INT64"},
+                    declared_bindings(session, "DECORATED_BY"),
+                )
+
+            execute_write_operation(self.driver, backend, _copy_decorated)
+            return
         decorated_labels = ("Function", "Class")
 
         def _work(session):
             for row in decorated_by_batch:
                 for decorated_label in decorated_labels:
+                    if self._symbol_index is not None and not self._decorated_by_candidate_exists(
+                        row, decorated_label
+                    ):
+                        # Same outcome as the MATCH below finding nothing, without the query.
+                        continue
                     decorated_cypher = _cypher_label(decorated_label, backend)
                     context_predicate = (
                         'WHERE $decorated_context = "" '
@@ -1604,6 +2042,19 @@ class GraphWriter:
             return
 
         backend = get_backend_type(self.driver, self._db_manager)
+        if self._use_index_writes(backend):
+            def _copy_previews(session):
+                copy_grouped_edges(
+                    session,
+                    "PREVIEWS",
+                    build_previews_edges(self._symbol_index, previews_batch),
+                    {"line_number": "INT64"},
+                    declared_bindings(session, "PREVIEWS"),
+                )
+
+            execute_write_operation(self.driver, backend, _copy_previews)
+            info_logger(f"[PREVIEWS] Complete: {len(previews_batch)} preview links processed.")
+            return
 
         def _work(session):
             for row in previews_batch:
@@ -1662,11 +2113,29 @@ class GraphWriter:
             return
 
         backend = get_backend_type(self.driver, self._db_manager)
+        if self._use_index_writes(backend):
+            def _copy_binds(session):
+                copy_grouped_edges(
+                    session,
+                    "BINDS",
+                    build_binds_edges(self._symbol_index, binds_batch),
+                    {"line_number": "INT64", "provider": "STRING", "confidence_label": "STRING"},
+                    declared_bindings(session, "BINDS"),
+                )
+
+            execute_write_operation(self.driver, backend, _copy_binds)
+            return
         label_pairs = (("Interface", "Class"), ("Class", "Class"), ("Interface", "Interface"))
 
         def _work(session):
             for row in binds_batch:
                 for source_label, target_label in label_pairs:
+                    if self._symbol_index is not None and not (
+                        self._symbol_index.has_node(source_label, row["source_name"], row["source_path"])
+                        and self._symbol_index.has_node(target_label, row["target_name"], row["target_path"])
+                    ):
+                        # The MATCH pair below would find no endpoints; skip the query.
+                        continue
                     source_cypher = _cypher_label(source_label, backend)
                     target_cypher = _cypher_label(target_label, backend)
                     try:
@@ -1707,6 +2176,19 @@ class GraphWriter:
             return
 
         backend = get_backend_type(self.driver, self._db_manager)
+        if self._use_index_writes(backend):
+            def _copy_metaclass(session):
+                copy_grouped_edges(
+                    session,
+                    "METACLASS",
+                    build_metaclass_edges(self._symbol_index, metaclass_batch),
+                    {"line_number": "INT64", "confidence_label": "STRING"},
+                    declared_bindings(session, "METACLASS"),
+                )
+
+            execute_write_operation(self.driver, backend, _copy_metaclass)
+            info_logger(f"[METACLASS] Complete: {len(metaclass_batch)} metaclass links processed.")
+            return
 
         def _work(session):
             for row in metaclass_batch:
@@ -1739,6 +2221,19 @@ class GraphWriter:
             return
 
         backend = get_backend_type(self.driver, self._db_manager)
+        if self._use_index_writes(backend):
+            def _copy_companion(session):
+                copy_grouped_edges(
+                    session,
+                    "COMPANION_OF",
+                    build_companion_of_edges(self._symbol_index, companion_batch),
+                    {},
+                    declared_bindings(session, "COMPANION_OF"),
+                )
+
+            execute_write_operation(self.driver, backend, _copy_companion)
+            info_logger(f"[COMPANION_OF] Complete: {len(companion_batch)} companion links processed.")
+            return
 
         def _work(session):
             for row in companion_batch:
@@ -1777,6 +2272,19 @@ class GraphWriter:
             return
 
         backend = get_backend_type(self.driver, self._db_manager)
+        if self._use_index_writes(backend):
+            def _copy_embeds(session):
+                copy_grouped_edges(
+                    session,
+                    "EMBEDS",
+                    build_embeds_edges(self._symbol_index, embeds_batch),
+                    {"line_number": "INT64"},
+                    declared_bindings(session, "EMBEDS"),
+                )
+
+            execute_write_operation(self.driver, backend, _copy_embeds)
+            info_logger(f"[EMBEDS] Complete: {len(embeds_batch)} embed links processed.")
+            return
 
         def _work(session):
             for row in embeds_batch:
@@ -1933,6 +2441,8 @@ class GraphWriter:
                     warning_logger(f"Failed to link C++ methods for label {clab}: {e}")
 
         execute_write_operation(self.driver, backend, _work)
+        if self._symbol_index is not None:
+            add_cpp_class_function_edges(self._symbol_index, repo_path_str)
 
     def repair_missing_contains_links(self, repo_path_str: str) -> Dict[str, int]:
         """Post-index invariant: every symbol under the repo must be reachable
@@ -1989,6 +2499,19 @@ class GraphWriter:
         info_logger(f"[SPRING] Writing {len(inject_batch)} INJECTS edges...")
         batch_size = 500
         backend = get_backend_type(self.driver, self._db_manager)
+        if self._use_index_writes(backend):
+            def _copy_injects(session):
+                copy_grouped_edges(
+                    session,
+                    "INJECTS",
+                    build_inject_edges(self._symbol_index, inject_batch),
+                    {"field_name": "STRING", "inject_line": "INT64", "confidence_label": "STRING"},
+                    declared_bindings(session, "INJECTS"),
+                )
+
+            execute_write_operation(self.driver, backend, _copy_injects)
+            info_logger("[SPRING] INJECTS edges written.")
+            return
         def _work(session):
             for i in range(0, len(inject_batch), batch_size):
                 batch = inject_batch[i : i + batch_size]
@@ -2050,6 +2573,13 @@ class GraphWriter:
 
         batch_size = 200
         backend = get_backend_type(self.driver, self._db_manager)
+        if self._use_index_writes(backend):
+            def _copy_maven(session):
+                load_maven_graph(session, modules, child_relations, inter_module_deps, external_libs, repo_path_str)
+
+            execute_write_operation(self.driver, backend, _copy_maven)
+            info_logger("[MAVEN] Build graph written.")
+            return
         def _work(session):
             for i in range(0, len(modules), batch_size):
                 session.run(
@@ -2253,8 +2783,23 @@ class GraphWriter:
         if not class_table:
             return
 
-        batch_size = 500
         backend = get_backend_type(self.driver, self._db_manager)
+        if self._use_index_writes(backend):
+            def _copy_maps_to(session):
+                edges, tables = build_maps_to_edges(self._symbol_index, class_table)
+                load_db_tables(session, tables)
+                copy_grouped_edges(
+                    session,
+                    "MAPS_TO",
+                    edges,
+                    {"datastore": "STRING", "line_number": "INT64"},
+                    declared_bindings(session, "MAPS_TO"),
+                )
+            execute_write_operation(self.driver, backend, _copy_maps_to)
+            info_logger(f"[ORM] Written {len(class_table)} MAPS_TO edges")
+            return
+
+        batch_size = 500
         def _work(session):
             for i in range(0, len(class_table), batch_size):
                 session.run(
@@ -2289,8 +2834,37 @@ class GraphWriter:
                     "line_number": r.get("line_number", 0),
                 })
 
-        batch_size = 500
         backend = get_backend_type(self.driver, self._db_manager)
+        if self._use_index_writes(backend):
+            def _copy_query_edges(session):
+                by_operation, tables = build_function_table_edges(
+                    self._symbol_index,
+                    [
+                        (
+                            r.get("method_name"),
+                            r.get("method_path"),
+                            tbl,
+                            r.get("operation", "READS"),
+                            r.get("line_number", 0),
+                        )
+                        for r in method_queries
+                        for tbl in r["db_tables"]
+                    ],
+                )
+                load_db_tables(session, tables)
+                for op in ("READS", "WRITES"):
+                    copy_grouped_edges(
+                        session,
+                        op,
+                        by_operation.get(op, []),
+                        {"line_number": "INT64"},
+                        declared_bindings(session, op),
+                    )
+            execute_write_operation(self.driver, backend, _copy_query_edges)
+            info_logger(f"[ORM] Written {len(edges)} READS/WRITES query edges")
+            return
+
+        batch_size = 500
         def _work(session):
             for op in ("READS", "WRITES"):
                 op_edges = [e for e in edges if e["operation"] == op]
@@ -2330,8 +2904,30 @@ class GraphWriter:
         if not edges:
             return
 
-        batch_size = 500
         backend = get_backend_type(self.driver, self._db_manager)
+        if self._use_index_writes(backend):
+            def _copy_mybatis_edges(session):
+                by_operation, tables = build_function_table_edges(
+                    self._symbol_index,
+                    [
+                        (e["method_name"], e["method_path"], e["table_name"], e["operation"], None)
+                        for e in edges
+                    ],
+                )
+                load_db_tables(session, tables)
+                for op in ("READS", "WRITES"):
+                    copy_grouped_edges(
+                        session,
+                        op,
+                        by_operation.get(op, []),
+                        {"line_number": "INT64"},
+                        declared_bindings(session, op),
+                    )
+            execute_write_operation(self.driver, backend, _copy_mybatis_edges)
+            info_logger(f"[MYBATIS] Submitted {len(edges)} READS/WRITES MyBatis records")
+            return
+
+        batch_size = 500
         def _work(session):
             local_written = 0
             for op in ("READS", "WRITES"):

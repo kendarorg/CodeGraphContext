@@ -8,7 +8,7 @@ backends score stored embeddings with in-process cosine similarity.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from ...utils.debug_log import warning_logger
 from .embeddings import cosine_similarity, detect_graph_backend
@@ -151,3 +151,81 @@ class VectorResolver:
             if resolved:
                 results[idx] = resolved
         return results
+
+
+class InMemoryVectorResolver:
+    """Cosine tiebreak over embeddings held in memory (repo-init path).
+
+    Scores the same candidates as ``VectorResolver._resolve_property_scan``:
+    entries with the called name whose path is a candidate, at or above the
+    threshold. Entries are scanned in the order given, and on equal scores the
+    later entry wins, as in the property scan. No database is touched.
+    """
+
+    def __init__(
+        self,
+        embedder: Any,
+        entries: Sequence[Tuple[str, str, Sequence[float]]],
+        threshold: float = _DEFAULT_THRESHOLD,
+    ):
+        self._embedder = embedder
+        self.threshold = threshold
+        # called name -> [(path, vector)] in entry order
+        self._by_name: Dict[str, List[Tuple[str, List[float]]]] = {}
+        for name, path, vec in entries:
+            if vec is None or len(vec) == 0:
+                continue
+            self._by_name.setdefault(name, []).append((path, list(vec)))
+
+    @classmethod
+    def from_function_records(
+        cls,
+        embedder: Any,
+        functions: Sequence[Dict[str, Any]],
+        vectors: Dict[int, Sequence[float]],
+        threshold: float = _DEFAULT_THRESHOLD,
+    ) -> "InMemoryVectorResolver":
+        """Build from parsed Function records and the {index: vector} map from
+        ``embeddings.embed_functions_in_memory``. Records without a vector are skipped."""
+        entries = [
+            (functions[i]["name"], functions[i]["path"], vec)
+            for i, vec in sorted(vectors.items())
+        ]
+        return cls(embedder, entries, threshold=threshold)
+
+    def resolve(
+        self,
+        called_name: str,
+        caller_qualified_name: Optional[str],
+        candidate_paths: List[str],
+        repo_path: Optional[str] = None,
+    ) -> Optional[str]:
+        """Return the file path of the best-matching Function among candidates.
+
+        ``repo_path`` is accepted for signature parity with ``VectorResolver``; the
+        entries are already limited to the repository being indexed.
+        """
+        if not candidate_paths:
+            return None
+        candidates = self._by_name.get(called_name)
+        if not candidates:
+            return None
+
+        query_text = f"{caller_qualified_name or ''} calls {called_name}"
+        try:
+            query_vec = self._embedder.embed_batch([query_text])[0]
+        except Exception as e:
+            warning_logger(f"[VECTOR] Embed query failed: {e}")
+            return None
+
+        allowed = set(candidate_paths)
+        best_path: Optional[str] = None
+        best_score = self.threshold
+        for path, vec in candidates:
+            if path not in allowed:
+                continue
+            score = cosine_similarity(query_vec, vec)
+            if score >= best_score:
+                best_score = score
+                best_path = path
+        return best_path

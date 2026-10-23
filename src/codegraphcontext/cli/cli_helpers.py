@@ -26,6 +26,7 @@ from ..core import get_database_manager
 from ..core.jobs import JobManager
 from ..tools.code_finder import CodeFinder
 from ..tools.graph_builder import GraphBuilder
+from ..tools.indexing.repo_init import RepoAlreadyIndexedError, initialize_repository
 from ..utils import graph_shapes
 from ..tools.package_resolver import get_local_package_path
 from ..utils.debug_log import info_logger, warning_logger
@@ -439,6 +440,35 @@ def index_helper(path: str, context: Optional[str] = None, no_progress: bool = F
             
     except Exception as e:
         console.print(f"[bold red]An error occurred during indexing:[/bold red] {e}")
+        raise typer.Exit(code=1)
+    finally:
+        db_manager.close_driver()
+
+
+def repo_init_helper(path: str, context: Optional[str] = None):
+    """Indexes a repository into an empty graph via initialize_repository (``cgc index --repo-init``)."""
+    path_obj = Path(path).resolve()
+    index_cwd = path_obj if path_obj.is_dir() else path_obj.parent
+    services = _initialize_services(context, cwd=index_cwd)
+    if not all(services[:3]):
+        _fail_services_init()
+
+    db_manager, graph_builder, _code_finder, _ctx = services
+
+    if not path_obj.exists():
+        console.print(f"[red]Error: Path does not exist: {path_obj}[/red]")
+        db_manager.close_driver()
+        raise typer.Exit(code=1)
+
+    console.print(f"Starting repo-init for: {path_obj}")
+    try:
+        asyncio.run(initialize_repository(graph_builder, path_obj))
+        console.print(f"[green]Successfully initialized: {path_obj}[/green]")
+    except RepoAlreadyIndexedError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(code=1)
+    except Exception as e:
+        console.print(f"[bold red]An error occurred during repo-init:[/bold red] {e}")
         raise typer.Exit(code=1)
     finally:
         db_manager.close_driver()

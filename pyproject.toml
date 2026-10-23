@@ -120,6 +120,8 @@ kuzu = [
     # Same wheel-availability marker as the core dependency above: no
     # cp314 wheels exist for macOS/Windows and the sdist cannot be built.
     "kuzu; python_version < '3.14' or sys_platform == 'linux'",
+    # Parquet files for the bulk node load (persistence/bulk_kuzu.py).
+    "pyarrow>=14",
 ]
 ladybug = [
     "ladybug>=0.19,<0.20; sys_platform == 'win32' or (sys_platform != 'win32' and python_version >= '3.10')",
